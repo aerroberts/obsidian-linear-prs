@@ -50,8 +50,8 @@ async function details(token:string,repo:string,number:number,issue:Issue,attach
   const path=`/repos/${repo}/pulls/${number}`;
   const p=await gh(token,path);if(p.state!=='open')return null;
   if(!attached){const pattern=new RegExp(`(^|[^A-Za-z0-9])${issue.identifier.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}([^A-Za-z0-9]|$)`,'i');if(!pattern.test([p.title,p.body??'',p.head?.ref??''].join('\n')))return null;}
-  const [reviews,checkRuns,status,comments]=await Promise.allSettled([
-    gh(token,`${path}/reviews?per_page=100`),gh(token,`/repos/${repo}/commits/${p.head.sha}/check-runs?per_page=100`),gh(token,`/repos/${repo}/commits/${p.head.sha}/status`),gh(token,`${path}/comments?per_page=1`)
+  const [reviews,checkRuns,status,reviewComments,issueComments]=await Promise.allSettled([
+    gh(token,`${path}/reviews?per_page=100`),gh(token,`/repos/${repo}/commits/${p.head.sha}/check-runs?per_page=100`),gh(token,`/repos/${repo}/commits/${p.head.sha}/status`),gh(token,`${path}/comments?per_page=100`),gh(token,`/repos/${repo}/issues/${number}/comments?per_page=100`)
   ]);
   const reviewerMap=new Map<string,string>();
   for(const r of reviews.status==='fulfilled'?reviews.value:[])if(r.user?.login && ['APPROVED','CHANGES_REQUESTED','COMMENTED','DISMISSED'].includes(r.state))reviewerMap.set(r.user.login,r.state.toLowerCase());
@@ -59,7 +59,8 @@ async function details(token:string,repo:string,number:number,issue:Issue,attach
   const checks:{name:string;status:string}[]=[];
   if(checkRuns.status==='fulfilled')for(const c of checkRuns.value.check_runs??[])checks.push({name:c.name,status:c.status!=='completed'?'pending':c.conclusion==='success'?'success':'failure'});
   if(status.status==='fulfilled')for(const s of status.value.statuses??[])checks.push({name:s.context,status:s.state==='success'?'success':s.state==='pending'?'pending':'failure'});
-  return {id:`${repo}#${number}`,url:p.html_url,repo,number,title:p.title,draft:p.draft,state:p.draft?'draft':'open',createdAt:p.created_at,issueId:issue.id,groupId:issue.id,groupTitle:`${issue.identifier} ${issue.title}`,groupUrl:issue.url,checks,reviewers:[...reviewerMap].map(([login,status])=>({login,status})),automerge:!!p.auto_merge,conflicts:p.mergeable===false,comments:(p.comments??0)>0||(p.review_comments??0)>0||(comments.status==='fulfilled'&&comments.value.length>0)};
+  const hasHumanComments=[reviewComments,issueComments].some(result=>result.status==='fulfilled'&&result.value.some((comment:{user?:{type?:string}})=>comment.user?.type==='User'));
+  return {id:`${repo}#${number}`,url:p.html_url,repo,number,title:p.title,draft:p.draft,state:p.draft?'draft':'open',createdAt:p.created_at,issueId:issue.id,groupId:issue.id,groupTitle:`${issue.identifier} ${issue.title}`,groupUrl:issue.url,checks,reviewers:[...reviewerMap].map(([login,status])=>({login,status})),automerge:!!p.auto_merge,conflicts:p.mergeable===false,comments:hasHumanComments};
 }
 async function mapLimit<T>(items:T[],limit:number,fn:(item:T)=>Promise<void>):Promise<void>{
   let index=0;

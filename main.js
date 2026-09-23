@@ -100,11 +100,12 @@ async function details(token, repo, number, issue, attached) {
     const pattern = new RegExp(`(^|[^A-Za-z0-9])${issue.identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9]|$)`, "i");
     if (!pattern.test([p.title, p.body ?? "", p.head?.ref ?? ""].join("\n"))) return null;
   }
-  const [reviews, checkRuns, status, comments] = await Promise.allSettled([
+  const [reviews, checkRuns, status, reviewComments, issueComments] = await Promise.allSettled([
     gh(token, `${path}/reviews?per_page=100`),
     gh(token, `/repos/${repo}/commits/${p.head.sha}/check-runs?per_page=100`),
     gh(token, `/repos/${repo}/commits/${p.head.sha}/status`),
-    gh(token, `${path}/comments?per_page=1`)
+    gh(token, `${path}/comments?per_page=100`),
+    gh(token, `/repos/${repo}/issues/${number}/comments?per_page=100`)
   ]);
   const reviewerMap = /* @__PURE__ */ new Map();
   for (const r of reviews.status === "fulfilled" ? reviews.value : []) if (r.user?.login && ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(r.state)) reviewerMap.set(r.user.login, r.state.toLowerCase());
@@ -112,7 +113,8 @@ async function details(token, repo, number, issue, attached) {
   const checks = [];
   if (checkRuns.status === "fulfilled") for (const c of checkRuns.value.check_runs ?? []) checks.push({ name: c.name, status: c.status !== "completed" ? "pending" : c.conclusion === "success" ? "success" : "failure" });
   if (status.status === "fulfilled") for (const s of status.value.statuses ?? []) checks.push({ name: s.context, status: s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure" });
-  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue.id, groupId: issue.id, groupTitle: `${issue.identifier} ${issue.title}`, groupUrl: issue.url, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: (p.comments ?? 0) > 0 || (p.review_comments ?? 0) > 0 || comments.status === "fulfilled" && comments.value.length > 0 };
+  const hasHumanComments = [reviewComments, issueComments].some((result) => result.status === "fulfilled" && result.value.some((comment) => comment.user?.type === "User"));
+  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue.id, groupId: issue.id, groupTitle: `${issue.identifier} ${issue.title}`, groupUrl: issue.url, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: hasHumanComments };
 }
 async function mapLimit(items, limit, fn) {
   let index = 0;
@@ -211,9 +213,19 @@ var empty = () => ({ version: 1, reviewTypes: {}, reviewMessage: [], collapsed: 
 function message(prs) {
   return ["Some prs to review:", "", ...prs.map((p, i) => `${i + 1}. ${p.title} ${p.url}`)].join("\n");
 }
-function button(parent, label, icon, click, active = false) {
-  const b = parent.createEl("button", { cls: `linear-prs-button${active ? " is-active" : ""}`, attr: { "aria-label": label, title: label } });
-  b.setText(icon);
+function icon(parent, name, title, cls = "") {
+  const el = parent.createSpan({ cls: `linear-prs-icon ${cls}` });
+  (0, import_obsidian2.setIcon)(el, name);
+  if (title) {
+    el.setAttr("title", title);
+    el.setAttr("aria-label", title);
+    el.setAttr("role", "img");
+  }
+  return el;
+}
+function button(parent, label, name, click, active = false) {
+  const b = parent.createEl("button", { cls: `linear-prs-button${active ? " is-active" : ""}`, attr: { "aria-label": label, title: label, type: "button" } });
+  (0, import_obsidian2.setIcon)(b, name);
   b.onclick = (e) => {
     e.stopPropagation();
     click();
@@ -221,8 +233,11 @@ function button(parent, label, icon, click, active = false) {
   return b;
 }
 function date(iso) {
-  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 864e5);
-  return days < 1 ? "today" : days === 1 ? "1d ago" : `${days}d ago`;
+  const hours = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 36e5));
+  if (hours < 1) return "opened just now";
+  if (hours < 24) return `opened ${hours} ${hours === 1 ? "hour" : "hours"} ago`;
+  const days = Math.floor(hours / 24);
+  return `opened ${days} ${days === 1 ? "day" : "days"} ago`;
 }
 function safeError(e) {
   return e instanceof Error ? e.message : String(e);
@@ -354,12 +369,13 @@ var BoardView = class extends import_obsidian2.ItemView {
   queue(prs, title, parent) {
     const details2 = parent.createEl("details", { cls: "linear-prs-group" });
     details2.open = true;
-    const summary = details2.createEl("summary");
+    const summary = details2.createEl("summary", { cls: "linear-prs-group-header" });
+    icon(summary, "chevron-down", void 0, "linear-prs-chevron");
     summary.createSpan({ text: title, cls: "linear-prs-group-title" });
     const tools = summary.createSpan({ cls: "linear-prs-actions" });
     tools.createSpan({ text: String(prs.length), cls: "linear-prs-count" });
-    button(tools, `Copy ${title}`, "\u29C9", () => void this.copy(message(prs)));
-    button(tools, `Launch ${title}`, "\u27A4", () => void this.launchMany(prs));
+    button(tools, `Copy ${title}`, "copy", () => void this.copy(message(prs)));
+    button(tools, `Launch ${title}`, "rocket", () => void this.launchMany(prs));
     const list = details2.createDiv({ cls: "linear-prs-list" });
     if (!prs.length) list.createDiv({ text: title === "PRs in Review" ? "No pull requests in review" : "No pull requests to stamp", cls: "linear-prs-empty" });
     else prs.forEach((p) => this.row(p, list));
@@ -402,19 +418,19 @@ var BoardView = class extends import_obsidian2.ItemView {
     const block = parent.createDiv({ cls: "linear-prs-review-block" });
     block.createEl("pre", { text: message(items) });
     const actions = block.createDiv({ cls: "linear-prs-actions" });
-    button(actions, "Mark all as please stamp", "\u25A3", () => void this.act(async () => {
+    button(actions, "Mark all as please stamp", "stamp", () => void this.act(async () => {
       await this.track("stamp", items);
       m.reviewMessage = [];
       await this.plugin.saveMetadata();
     }, "Moved to stamp"));
-    button(actions, "Mark all as please review", "\u25C9", () => void this.act(async () => {
+    button(actions, "Mark all as please review", "eye", () => void this.act(async () => {
       await this.track("review", items);
       m.reviewMessage = [];
       await this.plugin.saveMetadata();
     }, "Moved to review"));
-    button(actions, "Launch review PRs", "\u27A4", () => void this.launchMany(items));
-    button(actions, "Copy review message", "\u29C9", () => void this.copy(message(items)));
-    button(actions, "Clear review message", "\u232B", () => void this.act(async () => {
+    button(actions, "Launch review PRs", "rocket", () => void this.launchMany(items));
+    button(actions, "Copy review message", "copy", () => void this.copy(message(items)));
+    button(actions, "Clear review message", "trash-2", () => void this.act(async () => {
       m.reviewMessage = [];
       await this.plugin.saveMetadata();
     }, "Cleared review message"));
@@ -423,54 +439,55 @@ var BoardView = class extends import_obsidian2.ItemView {
     const m = this.plugin.metadata;
     const row = parent.createDiv({ cls: "linear-prs-row" });
     const top = row.createDiv({ cls: "linear-prs-row-top" });
-    const link = top.createEl("a", { text: p.title, href: p.url, cls: "linear-prs-title" });
+    const link = top.createEl("a", { href: p.url, cls: "linear-prs-title" });
     link.setAttr("target", "_blank");
-    link.textContent = (p.draft ? "\u25CC " : "\u25C9 ") + p.title;
-    const controls = top.createSpan({ cls: "linear-prs-actions" });
-    button(controls, "Close and remove pull request", "\u232B", () => void this.act(async () => {
+    icon(link, p.draft ? "git-pull-request-draft" : "git-pull-request", p.draft ? "draft" : "open", p.draft ? "dim" : "good");
+    link.createSpan({ text: p.title, cls: "linear-prs-title-text" });
+    const controls = top.createSpan({ cls: "linear-prs-actions linear-prs-controls" });
+    const remove = controls.createSpan({ cls: "linear-prs-control-set" });
+    button(remove, "Close and remove pull request", "trash-2", () => void this.act(async () => {
       await closePr(this.plugin.credentials(), p);
       m.hidden.push(p.id);
       await this.plugin.saveMetadata();
     }, "Closed and removed PR"));
-    button(controls, "Add to review message", "\u29C9", () => void this.act(async () => {
+    const review = controls.createSpan({ cls: "linear-prs-control-set" });
+    button(review, "Add to review message", "copy", () => void this.act(async () => {
       if (!m.reviewMessage.includes(p.id)) m.reviewMessage.push(p.id);
       await this.plugin.saveMetadata();
       await navigator.clipboard.writeText(message(m.reviewMessage.map((id) => m.pullRequests.find((x) => x.id === id)).filter((x) => !!x)));
     }, "Added to review message"));
-    button(controls, "Please stamp", "\u25A3", () => void this.act(() => this.track(m.reviewTypes[p.id] === "stamp" ? "none" : "stamp", [p]), "Updated review type"), m.reviewTypes[p.id] === "stamp");
-    button(controls, "Please review", "\u25C9", () => void this.act(() => this.track(m.reviewTypes[p.id] === "review" ? "none" : "review", [p]), "Updated review type"), m.reviewTypes[p.id] === "review");
-    const badges = top.createSpan({ cls: "linear-prs-badges" });
-    const badge = (text, title, cls = "") => {
-      const b = badges.createSpan({ text, cls: `linear-prs-badge ${cls}` });
-      b.setAttr("title", title);
-    };
-    badge("\u25A4", p.comments ? "Pull request has comments" : "Pull request has no comments", p.comments ? "warn" : "dim");
-    badge("\u265F", p.reviewers.length ? p.reviewers.map((r) => `${r.login}: ${r.status}`).join(", ") : "No reviewers assigned", p.reviewers.length && p.reviewers.every((r) => r.status === "approved") ? "good" : "dim");
-    badge("\u25C6", p.automerge ? "Automerge enabled" : "Automerge disabled", p.automerge ? "good" : "dim");
+    button(review, "Please stamp", "stamp", () => void this.act(() => this.track(m.reviewTypes[p.id] === "stamp" ? "none" : "stamp", [p]), "Updated review type"), m.reviewTypes[p.id] === "stamp");
+    button(review, "Please review", "eye", () => void this.act(() => this.track(m.reviewTypes[p.id] === "review" ? "none" : "review", [p]), "Updated review type"), m.reviewTypes[p.id] === "review");
+    const badges = controls.createSpan({ cls: "linear-prs-control-set linear-prs-badges" });
+    icon(badges, "message-square", p.comments ? "Pull request has comments" : "Pull request has no comments", p.comments ? "orange" : "dim");
+    icon(badges, "user", p.reviewers.length ? p.reviewers.map((r) => `${r.login}: ${r.status}`).join(", ") : "No reviewers assigned", p.reviewers.length && p.reviewers.every((r) => r.status === "approved") ? "good" : "dim");
+    icon(badges, "git-merge", p.automerge ? "Automerge enabled" : "Automerge disabled", p.automerge ? "good" : "dim");
     const checkTitle = [p.conflicts ? "Merge conflicts" : "", ...p.checks.map((c) => `${c.name}: ${c.status}`)].filter(Boolean).join(", ") || "No checks";
-    badge(p.conflicts || p.checks.some((c) => c.status === "failure") ? "\u2297" : p.checks.some((c) => c.status === "pending") ? "\u25CC" : "\u2713", checkTitle, p.conflicts || p.checks.some((c) => c.status === "failure") ? "bad" : p.checks.some((c) => c.status === "pending") ? "dim" : "good");
+    const checkStatus = p.conflicts || p.checks.some((c) => c.status === "failure") ? "bad" : p.checks.some((c) => c.status === "pending") ? "dim" : "good";
+    icon(badges, checkStatus === "bad" ? "circle-x" : checkStatus === "dim" ? "loader-circle" : "circle-check", checkTitle, checkStatus);
     const meta = row.createDiv({ cls: "linear-prs-meta" });
-    const a = meta.createEl("a", { href: p.url });
+    const a = meta.createEl("a", { href: p.url, cls: "linear-prs-meta-link" });
     a.setAttr("target", "_blank");
     a.createSpan({ text: p.repo, cls: "linear-prs-pill" });
     a.createSpan({ text: `#${p.number}`, cls: "linear-prs-pill" });
-    meta.createSpan({ text: date(p.createdAt) });
+    meta.createSpan({ text: date(p.createdAt), cls: "linear-prs-date" });
   }
   group(prs, id, title, url, parent) {
     const m = this.plugin.metadata;
     const details2 = parent.createEl("details", { cls: "linear-prs-group" });
     details2.open = !m.collapsed.includes(id);
-    const summary = details2.createEl("summary");
+    const summary = details2.createEl("summary", { cls: "linear-prs-group-header" });
+    icon(summary, "chevron-down", void 0, "linear-prs-chevron");
     const titleLink = summary.createEl("a", { text: title, href: url, cls: "linear-prs-group-title" });
     titleLink.setAttr("target", "_blank");
     titleLink.onclick = (e) => e.stopPropagation();
     const actions = summary.createSpan({ cls: "linear-prs-actions" });
     actions.createSpan({ text: String(prs.length), cls: "linear-prs-count" });
-    button(actions, "Launch group PRs", "\u27A4", () => void this.launchMany(prs));
+    button(actions, "Launch group PRs", "rocket", () => void this.launchMany(prs));
     const reviewers = this.plugin.settings.favoriteReviewers.split(",").map((s) => s.trim()).filter(Boolean);
     if (reviewers.length) {
-      const select = actions.createEl("select", { attr: { "aria-label": "Assign reviewer to group PRs" } });
-      select.createEl("option", { text: "\u265F", value: "" });
+      const select = actions.createEl("select", { cls: "linear-prs-reviewer-select", attr: { "aria-label": "Assign reviewer to group PRs" } });
+      select.createEl("option", { text: "Reviewer", value: "" });
       for (const login of reviewers) select.createEl("option", { text: login, value: login });
       select.onclick = (e) => e.stopPropagation();
       select.onchange = () => {
@@ -494,12 +511,15 @@ var BoardView = class extends import_obsidian2.ItemView {
     root.empty();
     root.addClass("linear-prs");
     const m = this.plugin.metadata;
-    const header = root.createDiv({ cls: "linear-prs-header" });
-    header.createEl("h2", { text: "code" });
-    const right = header.createSpan({ cls: "linear-prs-actions" });
+    const shell = root.createDiv({ cls: "linear-prs-shell" });
+    const header = shell.createDiv({ cls: "linear-prs-header" });
+    header.createSpan({ text: "/ code", cls: "linear-prs-crumb" });
+    const right = header.createSpan({ cls: "linear-prs-toolbar" });
     const repos = [...new Set(m.pullRequests.map((p) => p.repo))].sort();
     if (repos.length) {
-      const sel = right.createEl("select", { attr: { "aria-label": "Filter repository" } });
+      const filter = right.createSpan({ cls: "linear-prs-repository-filter" });
+      icon(filter, "folder-git-2");
+      const sel = filter.createEl("select", { attr: { "aria-label": "Filter repository" } });
       sel.createEl("option", { text: "All repositories", value: "" });
       repos.forEach((r) => sel.createEl("option", { text: r, value: r }));
       sel.value = m.selectedRepo;
@@ -509,22 +529,19 @@ var BoardView = class extends import_obsidian2.ItemView {
         this.render();
       };
     }
-    button(right, "Archived pull requests", "\u25A4", () => {
+    button(right, "Archived pull requests", "archive", () => {
       this.archived = !this.archived;
       this.render();
     }, this.archived);
-    button(right, "Refresh from Linear and GitHub", this.busy ? "\u25CC" : "\u21BB", () => void this.refresh());
-    if (!this.plugin.settings.linearKey || !this.plugin.settings.githubKey) root.createDiv({ text: "Add a Linear API key and GitHub API key in Linear PRs settings, then refresh.", cls: "linear-prs-empty" });
-    if (m.lastRefresh) root.createDiv({ text: `Updated ${new Date(m.lastRefresh).toLocaleString()}`, cls: "linear-prs-updated" });
+    button(right, "Refresh from Linear and GitHub", "refresh-cw", () => void this.refresh());
+    if (!this.plugin.settings.linearKey || !this.plugin.settings.githubKey) shell.createDiv({ text: "Add a Linear API key and GitHub API key in Linear PRs settings, then refresh.", cls: "linear-prs-empty" });
+    this.reviewBlock(shell);
     const all = this.visible();
-    this.reviewBlock(root);
     if (!this.archived) {
-      this.queue(all.filter((p) => m.reviewTypes[p.id] === "review"), "PRs in Review", root);
-      this.queue(all.filter((p) => m.reviewTypes[p.id] === "stamp"), "PRs To Be Stamped", root);
+      this.queue(all.filter((p) => m.reviewTypes[p.id] === "review"), "PRs in Review", shell);
+      this.queue(all.filter((p) => m.reviewTypes[p.id] === "stamp"), "PRs To Be Stamped", shell);
     }
-    const h = root.createEl("h3", { text: "Pull requests" });
-    h.addClass("linear-prs-section-title");
-    if (this.archived) h.setText("Archived pull requests");
+    const h = shell.createEl("h2", { text: this.archived ? "Archived pull requests" : "Pull requests", cls: "linear-prs-section-title" });
     const normal = this.archived ? all : all.filter((p) => (m.reviewTypes[p.id] ?? "none") === "none");
     const groups = /* @__PURE__ */ new Map();
     for (const p of normal) {
@@ -534,8 +551,8 @@ var BoardView = class extends import_obsidian2.ItemView {
     }
     for (const prs of groups.values()) {
       const p = prs[0];
-      this.group(prs, p.groupId, p.groupTitle, p.groupUrl, root);
+      this.group(prs, p.groupId, p.groupTitle, p.groupUrl, shell);
     }
-    if (!normal.length) root.createDiv({ text: "No pull requests", cls: "linear-prs-empty" });
+    if (!normal.length) shell.createDiv({ text: "No pull requests", cls: "linear-prs-empty" });
   }
 };

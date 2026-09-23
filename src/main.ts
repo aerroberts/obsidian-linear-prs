@@ -93,7 +93,7 @@ class BoardView extends ItemView {
   }
   private render(){
     const root=this.containerEl.children[1] as HTMLElement;root.empty();root.addClass('linear-prs');const m=this.plugin.metadata;
-    const shell=root.createDiv({cls:'linear-prs-shell'});const header=shell.createDiv({cls:'linear-prs-header'});header.createSpan({text:'/ code',cls:'linear-prs-crumb'});const right=header.createSpan({cls:'linear-prs-toolbar'});
+    const shell=root.createDiv({cls:'linear-prs-shell'});const header=shell.createDiv({cls:'linear-prs-header'});const right=header.createSpan({cls:'linear-prs-toolbar'});
     const repos=[...new Set(m.pullRequests.map(p=>p.repo))].sort();if(repos.length){const filter=right.createSpan({cls:'linear-prs-repository-filter'});icon(filter,'folder-git-2');const sel=filter.createEl('select',{attr:{'aria-label':'Filter repository'}});sel.createEl('option',{text:'All repositories',value:''});repos.forEach(r=>sel.createEl('option',{text:r,value:r}));sel.value=m.selectedRepo;sel.onchange=()=>{m.selectedRepo=sel.value;void this.plugin.saveMetadata();this.render();};}
     button(right,'Archived pull requests','archive',()=>{this.archived=!this.archived;this.render();},this.archived);button(right,'Refresh from Linear and GitHub','refresh-cw',()=>void this.refresh());
     if(!this.plugin.settings.linearKey||!this.plugin.settings.githubKey)shell.createDiv({text:'Add a Linear API key and GitHub API key in Linear PRs settings, then refresh.',cls:'linear-prs-empty'});

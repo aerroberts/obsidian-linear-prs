@@ -524,7 +524,6 @@ var BoardView = class extends import_obsidian2.ItemView {
     const m = this.plugin.metadata;
     const shell = root.createDiv({ cls: "linear-prs-shell" });
     const header = shell.createDiv({ cls: "linear-prs-header" });
-    header.createSpan({ text: "/ code", cls: "linear-prs-crumb" });
     const right = header.createSpan({ cls: "linear-prs-toolbar" });
     const repos = [...new Set(m.pullRequests.map((p) => p.repo))].sort();
     if (repos.length) {

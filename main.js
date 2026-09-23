@@ -114,7 +114,7 @@ async function details(token, repo, number, issue, attached) {
   if (checkRuns.status === "fulfilled") for (const c of checkRuns.value.check_runs ?? []) checks.push({ name: c.name, status: c.status !== "completed" ? "pending" : c.conclusion === "success" ? "success" : "failure" });
   if (status.status === "fulfilled") for (const s of status.value.statuses ?? []) checks.push({ name: s.context, status: s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure" });
   const hasHumanComments = [reviewComments, issueComments].some((result) => result.status === "fulfilled" && result.value.some((comment) => comment.user?.type === "User"));
-  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue.id, groupId: issue.id, groupTitle: `${issue.identifier} ${issue.title}`, groupUrl: issue.url, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: hasHumanComments };
+  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue.id, groupId: issue.id, groupTitle: issue.title, groupUrl: issue.url, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: hasHumanComments };
 }
 async function mapLimit(items, limit, fn) {
   let index = 0;
@@ -551,7 +551,7 @@ var BoardView = class extends import_obsidian2.ItemView {
     }
     for (const prs of groups.values()) {
       const p = prs[0];
-      this.group(prs, p.groupId, p.groupTitle, p.groupUrl, shell);
+      this.group(prs, p.groupId, p.groupTitle.replace(/^[A-Z]+-\d+\s+/, ""), p.groupUrl, shell);
     }
     if (!normal.length) shell.createDiv({ text: "No pull requests", cls: "linear-prs-empty" });
   }

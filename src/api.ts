@@ -46,10 +46,10 @@ async function githubSearch(token:string,identifier:string):Promise<{repo:string
     if((data.items??[]).length<100)break;
   }return found;
 }
-async function details(token:string,repo:string,number:number,issue:Issue,attached:boolean):Promise<PR|null>{
+async function details(token:string,repo:string,number:number,issue?:Issue,attached=true,prefetched?:any):Promise<PR|null>{
   const path=`/repos/${repo}/pulls/${number}`;
-  const p=await gh(token,path);if(p.state!=='open')return null;
-  if(!attached){const pattern=new RegExp(`(^|[^A-Za-z0-9])${issue.identifier.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}([^A-Za-z0-9]|$)`,'i');if(!pattern.test([p.title,p.body??'',p.head?.ref??''].join('\n')))return null;}
+  const p=prefetched??await gh(token,path);if(p.state!=='open')return null;
+  if(issue&&!attached){const pattern=new RegExp(`(^|[^A-Za-z0-9])${issue.identifier.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}([^A-Za-z0-9]|$)`,'i');if(!pattern.test([p.title,p.body??'',p.head?.ref??''].join('\n')))return null;}
   const [reviews,checkRuns,status,reviewComments,issueComments]=await Promise.allSettled([
     gh(token,`${path}/reviews?per_page=100`),gh(token,`/repos/${repo}/commits/${p.head.sha}/check-runs?per_page=100`),gh(token,`/repos/${repo}/commits/${p.head.sha}/status`),gh(token,`${path}/comments?per_page=100`),gh(token,`/repos/${repo}/issues/${number}/comments?per_page=100`)
   ]);
@@ -60,10 +60,10 @@ async function details(token:string,repo:string,number:number,issue:Issue,attach
   if(checkRuns.status==='fulfilled')for(const c of checkRuns.value.check_runs??[])checks.push({name:c.name,status:c.status!=='completed'?'pending':c.conclusion==='success'?'success':'failure'});
   if(status.status==='fulfilled')for(const s of status.value.statuses??[])checks.push({name:s.context,status:s.state==='success'?'success':s.state==='pending'?'pending':'failure'});
   const hasHumanComments=[reviewComments,issueComments].some(result=>result.status==='fulfilled'&&result.value.some((comment:{user?:{type?:string}})=>comment.user?.type==='User'));
-  const groupId=issue.parent?.id??issue.project?.id??'unparented';
-  const groupTitle=issue.parent?.title??issue.project?.name??'Unparented issues';
-  const groupUrl=issue.parent?.url??issue.project?.url??'';
-  return {id:`${repo}#${number}`,url:p.html_url,repo,number,title:p.title,draft:p.draft,state:p.draft?'draft':'open',createdAt:p.created_at,issueId:issue.id,issueTitle:issue.title,issueUrl:issue.url,groupId,groupTitle,groupUrl,checks,reviewers:[...reviewerMap].map(([login,status])=>({login,status})),automerge:!!p.auto_merge,conflicts:p.mergeable===false,comments:hasHumanComments};
+  const groupId=issue?(issue.parent?.id??issue.project?.id??'unparented'):'unlinked';
+  const groupTitle=issue?(issue.parent?.title??issue.project?.name??'Unparented issues'):'';
+  const groupUrl=issue?(issue.parent?.url??issue.project?.url??''):'';
+  return {id:`${repo}#${number}`,url:p.html_url,repo,number,title:p.title,draft:p.draft,state:p.draft?'draft':'open',createdAt:p.created_at,issueId:issue?.id??'',issueTitle:issue?.title,issueUrl:issue?.url,groupId,groupTitle,groupUrl,checks,reviewers:[...reviewerMap].map(([login,status])=>({login,status})),automerge:!!p.auto_merge,conflicts:p.mergeable===false,comments:hasHumanComments};
 }
 async function mapLimit<T>(items:T[],limit:number,fn:(item:T)=>Promise<void>):Promise<void>{
   let index=0;
@@ -71,7 +71,45 @@ async function mapLimit<T>(items:T[],limit:number,fn:(item:T)=>Promise<void>):Pr
     while(index<items.length){const item=items[index++];await fn(item);}
   }));
 }
+async function authoredOpenPrs(token:string):Promise<{repo:string;number:number;url:string}[]>{
+  const viewer=await gh(token,'/user');if(!viewer.login)throw new Error('Could not identify the GitHub API key owner.');
+  const prs:{repo:string;number:number;url:string}[]=[];
+  for(let page=1;page<=10;page++){
+    const q=encodeURIComponent(`is:pr is:open author:${viewer.login}`);
+    const result=await gh(token,`/search/issues?q=${q}&per_page=100&page=${page}`);
+    if(result.incomplete_results)throw new Error('GitHub returned incomplete pull request search results.');
+    for(const item of result.items??[]){const ref=parsePr(item.html_url);if(ref)prs.push({...ref,url:item.html_url});}
+    if((result.items??[]).length<100)break;
+    if(page===10)throw new Error('GitHub search exceeded its 1,000 pull request result limit.');
+  }
+  return prs;
+}
+async function attachedPrUrls(key:string,urls:string[]):Promise<Set<string>>{
+  const linked=new Set<string>();
+  for(let start=0;start<urls.length;start+=20){
+    const batch=urls.slice(start,start+20);
+    const fields=batch.map((url,i)=>`a${i}:attachmentsForURL(url:${JSON.stringify(url)}){nodes{id}}`).join(' ');
+    const data=await linear<Record<string,{nodes:{id:string}[]}>>(key,`query{${fields}}`);
+    batch.forEach((url,i)=>{if(data[`a${i}`]?.nodes.length)linked.add(url);});
+  }
+  return linked;
+}
+async function hasLinearIssueReference(key:string,pr:any,cache:Map<string,boolean>):Promise<boolean>{
+  const text=[pr.title,pr.body??'',pr.head?.ref??''].join('\n');
+  const identifiers=[...new Set((text.match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi)??[]).map(id=>id.toUpperCase()))];
+  for(const id of identifiers){
+    let exists=cache.get(id);
+    if(exists===undefined){
+      try{const result=await linear<{issue:{id:string}|null}>(key,'query($id:String!){issue(id:$id){id}}',{id});exists=!!result.issue;}
+      catch(e){if(!String(e).includes('Entity not found: Issue'))throw e;exists=false;}
+      cache.set(id,exists);
+    }
+    if(exists)return true;
+  }
+  return false;
+}
 export async function discover(c:Credentials):Promise<{prs:PR[];errors:string[]}>{
+  const authoredOpen=await authoredOpenPrs(c.githubKey);
   const roots=await assignedRoots(c.linearKey);const seen=new Set<string>();const issues:Issue[]=[];const errors:string[]=[];
   let frontier=roots;
   while(frontier.length){const batch=frontier.filter(i=>{if(seen.has(i.id))return false;seen.add(i.id);return true;});issues.push(...batch);const next:Issue[]=[];
@@ -90,6 +128,16 @@ export async function discover(c:Credentials):Promise<{prs:PR[];errors:string[]}
     for(const ref of refs.values()){const key=`${ref.repo}#${ref.number}`;if(used.has(key))continue;used.add(key);
       try{const pr=await details(c.githubKey,ref.repo,ref.number,issue,ref.attached);if(pr)prs.push(pr);}catch(e){errors.push(`${key}: ${String(e)}`);}
     }
+  });
+  const associatedIds=new Set(prs.map(pr=>pr.id));
+  const authored=authoredOpen.filter(pr=>!associatedIds.has(`${pr.repo}#${pr.number}`));
+  const attached=await attachedPrUrls(c.linearKey,authored.map(pr=>pr.url));
+  const issueExists=new Map<string,boolean>();
+  await mapLimit(authored.filter(pr=>!attached.has(pr.url)),6,async ref=>{
+    const pr=await gh(c.githubKey,`/repos/${ref.repo}/pulls/${ref.number}`);
+    if(pr.state!=='open'||await hasLinearIssueReference(c.linearKey,pr,issueExists))return;
+    const item=await details(c.githubKey,ref.repo,ref.number,undefined,true,pr);
+    if(item)prs.push(item);
   });
   return {prs,errors};
 }

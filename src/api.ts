@@ -1,7 +1,7 @@
 import { requestUrl } from 'obsidian';
 
-export type Issue = { id:string; identifier:string; title:string; url:string; state?:{type:string}; project?:{name:string}|null; parent?:{id:string}|null; attachments?:{nodes:{url:string}[];pageInfo:{hasNextPage:boolean;endCursor:string|null}}; children?:{nodes:Issue[];pageInfo:{hasNextPage:boolean;endCursor:string|null}} };
-export type PR = { id:string; url:string; repo:string; number:number; title:string; draft:boolean; state:string; createdAt:string; issueId:string; groupId:string; groupTitle:string; groupUrl:string; checks:{name:string;status:string}[]; reviewers:{login:string;status:string}[]; automerge:boolean; conflicts:boolean; comments:boolean };
+export type Issue = { id:string; identifier:string; title:string; url:string; state?:{type:string}; project?:{id:string;name:string;url:string}|null; parent?:{id:string;title:string;url:string}|null; attachments?:{nodes:{url:string}[];pageInfo:{hasNextPage:boolean;endCursor:string|null}}; children?:{nodes:Issue[];pageInfo:{hasNextPage:boolean;endCursor:string|null}} };
+export type PR = { id:string; url:string; repo:string; number:number; title:string; draft:boolean; state:string; createdAt:string; issueId:string; issueTitle?:string; issueUrl?:string; groupId:string; groupTitle:string; groupUrl:string; checks:{name:string;status:string}[]; reviewers:{login:string;status:string}[]; automerge:boolean; conflicts:boolean; comments:boolean };
 export type Credentials = {linearKey:string;githubKey:string};
 
 async function json(url:string, method:string, token:string, body?:unknown):Promise<any> {
@@ -14,7 +14,7 @@ async function linear<T>(key:string,query:string,variables:Record<string,unknown
   if(data.errors?.length) throw new Error(data.errors.map((e:{message:string})=>e.message).join('; '));
   return data.data as T;
 }
-const ISSUE_FIELDS='id identifier title url state { type } project { name } parent { id }';
+const ISSUE_FIELDS='id identifier title url state { type } project { id name url } parent { id title url }';
 const PAGE='pageInfo { hasNextPage endCursor }';
 async function assignedRoots(key:string):Promise<Issue[]>{
   const roots:Issue[]=[]; let after:string|null=null;
@@ -60,7 +60,10 @@ async function details(token:string,repo:string,number:number,issue:Issue,attach
   if(checkRuns.status==='fulfilled')for(const c of checkRuns.value.check_runs??[])checks.push({name:c.name,status:c.status!=='completed'?'pending':c.conclusion==='success'?'success':'failure'});
   if(status.status==='fulfilled')for(const s of status.value.statuses??[])checks.push({name:s.context,status:s.state==='success'?'success':s.state==='pending'?'pending':'failure'});
   const hasHumanComments=[reviewComments,issueComments].some(result=>result.status==='fulfilled'&&result.value.some((comment:{user?:{type?:string}})=>comment.user?.type==='User'));
-  return {id:`${repo}#${number}`,url:p.html_url,repo,number,title:p.title,draft:p.draft,state:p.draft?'draft':'open',createdAt:p.created_at,issueId:issue.id,groupId:issue.id,groupTitle:issue.title,groupUrl:issue.url,checks,reviewers:[...reviewerMap].map(([login,status])=>({login,status})),automerge:!!p.auto_merge,conflicts:p.mergeable===false,comments:hasHumanComments};
+  const groupId=issue.parent?.id??issue.project?.id??'unparented';
+  const groupTitle=issue.parent?.title??issue.project?.name??'Unparented issues';
+  const groupUrl=issue.parent?.url??issue.project?.url??'';
+  return {id:`${repo}#${number}`,url:p.html_url,repo,number,title:p.title,draft:p.draft,state:p.draft?'draft':'open',createdAt:p.created_at,issueId:issue.id,issueTitle:issue.title,issueUrl:issue.url,groupId,groupTitle,groupUrl,checks,reviewers:[...reviewerMap].map(([login,status])=>({login,status})),automerge:!!p.auto_merge,conflicts:p.mergeable===false,comments:hasHumanComments};
 }
 async function mapLimit<T>(items:T[],limit:number,fn:(item:T)=>Promise<void>):Promise<void>{
   let index=0;

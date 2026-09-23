@@ -37,7 +37,7 @@ async function linear(key, query, variables = {}) {
   if (data.errors?.length) throw new Error(data.errors.map((e) => e.message).join("; "));
   return data.data;
 }
-var ISSUE_FIELDS = "id identifier title url state { type } project { name } parent { id }";
+var ISSUE_FIELDS = "id identifier title url state { type } project { id name url } parent { id title url }";
 var PAGE = "pageInfo { hasNextPage endCursor }";
 async function assignedRoots(key) {
   const roots = [];
@@ -114,7 +114,10 @@ async function details(token, repo, number, issue, attached) {
   if (checkRuns.status === "fulfilled") for (const c of checkRuns.value.check_runs ?? []) checks.push({ name: c.name, status: c.status !== "completed" ? "pending" : c.conclusion === "success" ? "success" : "failure" });
   if (status.status === "fulfilled") for (const s of status.value.statuses ?? []) checks.push({ name: s.context, status: s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure" });
   const hasHumanComments = [reviewComments, issueComments].some((result) => result.status === "fulfilled" && result.value.some((comment) => comment.user?.type === "User"));
-  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue.id, groupId: issue.id, groupTitle: issue.title, groupUrl: issue.url, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: hasHumanComments };
+  const groupId = issue.parent?.id ?? issue.project?.id ?? "unparented";
+  const groupTitle = issue.parent?.title ?? issue.project?.name ?? "Unparented issues";
+  const groupUrl = issue.parent?.url ?? issue.project?.url ?? "";
+  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue.id, issueTitle: issue.title, issueUrl: issue.url, groupId, groupTitle, groupUrl, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: hasHumanComments };
 }
 async function mapLimit(items, limit, fn) {
   let index = 0;
@@ -466,7 +469,13 @@ var BoardView = class extends import_obsidian2.ItemView {
     const checkStatus = p.conflicts || p.checks.some((c) => c.status === "failure") ? "bad" : p.checks.some((c) => c.status === "pending") ? "dim" : "good";
     icon(badges, checkStatus === "bad" ? "circle-x" : checkStatus === "dim" ? "loader-circle" : "circle-check", checkTitle, checkStatus);
     const meta = row.createDiv({ cls: "linear-prs-meta" });
-    const a = meta.createEl("a", { href: p.url, cls: "linear-prs-meta-link" });
+    const refs = meta.createSpan({ cls: "linear-prs-meta-link" });
+    if (p.issueTitle && p.issueUrl) {
+      const issue = refs.createEl("a", { text: p.issueTitle, href: p.issueUrl, cls: "linear-prs-issue-title" });
+      issue.setAttr("target", "_blank");
+      issue.setAttr("title", p.issueTitle);
+    }
+    const a = refs.createEl("a", { href: p.url, cls: "linear-prs-meta-link" });
     a.setAttr("target", "_blank");
     a.createSpan({ text: p.repo, cls: "linear-prs-pill" });
     a.createSpan({ text: `#${p.number}`, cls: "linear-prs-pill" });
@@ -478,9 +487,11 @@ var BoardView = class extends import_obsidian2.ItemView {
     details2.open = !m.collapsed.includes(id);
     const summary = details2.createEl("summary", { cls: "linear-prs-group-header" });
     icon(summary, "chevron-down", void 0, "linear-prs-chevron");
-    const titleLink = summary.createEl("a", { text: title, href: url, cls: "linear-prs-group-title" });
-    titleLink.setAttr("target", "_blank");
-    titleLink.onclick = (e) => e.stopPropagation();
+    if (url) {
+      const titleLink = summary.createEl("a", { text: title, href: url, cls: "linear-prs-group-title" });
+      titleLink.setAttr("target", "_blank");
+      titleLink.onclick = (e) => e.stopPropagation();
+    } else summary.createSpan({ text: title, cls: "linear-prs-group-title" });
     const actions = summary.createSpan({ cls: "linear-prs-actions" });
     actions.createSpan({ text: String(prs.length), cls: "linear-prs-count" });
     button(actions, "Launch group PRs", "rocket", () => void this.launchMany(prs));

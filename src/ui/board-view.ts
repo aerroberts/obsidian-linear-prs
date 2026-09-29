@@ -371,14 +371,39 @@ export class BoardView extends ItemView {
     this.renderPullRequestMetadata(pullRequest, row);
   }
 
+  private async refreshPullRequest(pullRequest: PullRequest): Promise<void> {
+    if (this.busy || this.refreshingGroups.size || this.launching.size) {
+      return;
+    }
+    const key = `pr:${pullRequest.id}`;
+    this.refreshingGroups.add(key);
+    this.render();
+    try {
+      const result = await this.plugin.refreshPullRequest(pullRequest);
+      const status = !result
+        ? 'PR is no longer open'
+        : result.status === 'updated'
+          ? 'refreshed and rebased'
+          : result.status === 'up-to-date'
+            ? 'refreshed; branch is up to date'
+            : `refreshed; ${result.warning}`;
+      new Notice(`${pullRequest.id}: ${status}`, result?.status === 'failed' ? 0 : 8000);
+    } catch (error) {
+      new Notice(`${pullRequest.id}: ${errorMessage(error)}`, 0);
+    } finally {
+      this.refreshingGroups.delete(key);
+      this.render();
+    }
+  }
+
   private renderPullRequestActions(
     pullRequest: PullRequest,
     controls: HTMLElement,
   ): void {
     const metadata = this.plugin.metadata;
-    const remove = controls.createSpan({ cls: 'linear-prs-control-set' });
+    const actions = controls.createSpan({ cls: 'linear-prs-control-set' });
     createIconButton(
-      remove,
+      actions,
       'Close and remove pull request',
       'trash-2',
       () =>
@@ -388,9 +413,19 @@ export class BoardView extends ItemView {
           await this.plugin.saveMetadata();
         }, 'Closed and removed PR'),
     );
-    const review = controls.createSpan({ cls: 'linear-prs-control-set' });
+    const key = `pr:${pullRequest.id}`;
+    const refresh = createIconButton(
+      actions,
+      'Refresh and update pull request branch',
+      'refresh-cw',
+      () => void this.refreshPullRequest(pullRequest),
+      { loading: this.refreshingGroups.has(key) ? 'spin' : undefined },
+    );
+    if (this.busy || this.refreshingGroups.size || this.launching.size) {
+      refresh.disabled = true;
+    }
     createIconButton(
-      review,
+      actions,
       'Add to review message',
       'copy',
       () =>
@@ -408,9 +443,10 @@ export class BoardView extends ItemView {
           );
         }, 'Added to review message'),
     );
+    const staging = controls.createSpan({ cls: 'linear-prs-control-set' });
     for (const stage of STAGES) {
       createIconButton(
-        review,
+        staging,
         `Staging ${stage}`,
         stage,
         () =>

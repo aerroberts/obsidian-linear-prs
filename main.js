@@ -545,6 +545,19 @@ async function closePr(credentials, pr) {
     }
   );
 }
+async function updatePrBranch(credentials, pullRequest) {
+  const current = await requestGitHub(
+    credentials.githubKey,
+    `/repos/${pullRequest.repo}/pulls/${pullRequest.number}`
+  );
+  if (current.state !== "open") {
+    return {
+      status: "failed",
+      warning: `PR is ${current.state}; its branch was not updated.`
+    };
+  }
+  return rebasePullRequest(credentials.githubKey, pullRequest.repo, current);
+}
 
 // src/async.ts
 async function forEachConcurrent(items, limit, fn) {
@@ -1312,11 +1325,29 @@ var BoardView = class extends import_obsidian5.ItemView {
     renderPullRequestBadges(pullRequest, controls);
     this.renderPullRequestMetadata(pullRequest, row);
   }
+  async refreshPullRequest(pullRequest) {
+    if (this.busy || this.refreshingGroups.size || this.launching.size) {
+      return;
+    }
+    const key = `pr:${pullRequest.id}`;
+    this.refreshingGroups.add(key);
+    this.render();
+    try {
+      const result = await this.plugin.refreshPullRequest(pullRequest);
+      const status = !result ? "PR is no longer open" : result.status === "updated" ? "refreshed and rebased" : result.status === "up-to-date" ? "refreshed; branch is up to date" : `refreshed; ${result.warning}`;
+      new import_obsidian5.Notice(`${pullRequest.id}: ${status}`, result?.status === "failed" ? 0 : 8e3);
+    } catch (error) {
+      new import_obsidian5.Notice(`${pullRequest.id}: ${errorMessage(error)}`, 0);
+    } finally {
+      this.refreshingGroups.delete(key);
+      this.render();
+    }
+  }
   renderPullRequestActions(pullRequest, controls) {
     const metadata = this.plugin.metadata;
-    const remove = controls.createSpan({ cls: "linear-prs-control-set" });
+    const actions = controls.createSpan({ cls: "linear-prs-control-set" });
     createIconButton(
-      remove,
+      actions,
       "Close and remove pull request",
       "trash-2",
       () => void this.runAction(async () => {
@@ -1325,9 +1356,19 @@ var BoardView = class extends import_obsidian5.ItemView {
         await this.plugin.saveMetadata();
       }, "Closed and removed PR")
     );
-    const review = controls.createSpan({ cls: "linear-prs-control-set" });
+    const key = `pr:${pullRequest.id}`;
+    const refresh = createIconButton(
+      actions,
+      "Refresh and update pull request branch",
+      "refresh-cw",
+      () => void this.refreshPullRequest(pullRequest),
+      { loading: this.refreshingGroups.has(key) ? "spin" : void 0 }
+    );
+    if (this.busy || this.refreshingGroups.size || this.launching.size) {
+      refresh.disabled = true;
+    }
     createIconButton(
-      review,
+      actions,
       "Add to review message",
       "copy",
       () => void this.runAction(async () => {
@@ -1342,9 +1383,10 @@ var BoardView = class extends import_obsidian5.ItemView {
         );
       }, "Added to review message")
     );
+    const staging = controls.createSpan({ cls: "linear-prs-control-set" });
     for (const stage of STAGES) {
       createIconButton(
-        review,
+        staging,
         `Staging ${stage}`,
         stage,
         () => void this.runAction(
@@ -1747,6 +1789,15 @@ var LinearPrsPlugin = class extends import_obsidian6.Plugin {
     ];
     await this.saveMetadata();
     return result;
+  }
+  async refreshPullRequest(pullRequest) {
+    const refreshed = await this.refreshSelectedPrs([pullRequest]);
+    if (!refreshed.length) {
+      return void 0;
+    }
+    const branchUpdate = await updatePrBranch(this.credentials(), refreshed[0]);
+    await this.refreshSelectedPrs(refreshed);
+    return branchUpdate;
   }
   credentials() {
     return { linearKey: this.settings.linearKey, githubKey: this.settings.githubKey };

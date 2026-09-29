@@ -1,6 +1,6 @@
 import { Plugin, Notice } from 'obsidian';
 import { discover, discoverGroup, refreshPrs } from './api/discovery';
-import { markMergeQueued } from './api/github';
+import { markMergeQueued, updatePrBranch } from './api/github';
 import type { PullRequest } from './types';
 import {
   BOARD_VIEW_TYPE,
@@ -155,6 +155,16 @@ export default class LinearPrsPlugin extends Plugin {
     await this.saveMetadata();
     return result;
   }
+  async refreshPullRequest(pullRequest: PullRequest) {
+    const refreshed = await this.refreshSelectedPrs([pullRequest]);
+    if (!refreshed.length) {
+      return undefined;
+    }
+    const branchUpdate = await updatePrBranch(this.credentials(), refreshed[0]);
+    await this.refreshSelectedPrs(refreshed);
+    return branchUpdate;
+  }
+
   credentials() {
     return { linearKey: this.settings.linearKey, githubKey: this.settings.githubKey };
   }

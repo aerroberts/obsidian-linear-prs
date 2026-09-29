@@ -3,7 +3,12 @@ import { test } from 'node:test';
 import { migrateMetadata, createEmptyMetadata } from '../src/metadata';
 import { parsePullRequestUrl, referencedIdentifiers } from '../src/pull-request-matching';
 import { forEachConcurrent, withDeadline } from '../src/async';
-import { fetchPullRequest, launchPr, markMergeQueued } from '../src/api/github';
+import {
+  fetchPullRequest,
+  launchPr,
+  markMergeQueued,
+  updatePrBranch,
+} from '../src/api/github';
 import { rebasePullRequest } from '../src/api/rebase';
 
 function mockRequests(
@@ -382,4 +387,30 @@ test('verification waits for asynchronous branch updates', async () => {
   });
   assert.equal(reads, 2);
   assert.equal(result.status, 'updated');
+});
+
+test('row branch refresh uses current GitHub state without ready or auto-merge mutations', async () => {
+  mockPullRequestDetails();
+  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  assert.ok(pullRequest);
+  let latestFetched = false;
+  mockRequests(({ url, body }) => {
+    assert.equal(body, undefined);
+    if (url.endsWith('/pulls/42')) {
+      latestFetched = true;
+      return {
+        ...remotePullRequest,
+        draft: true,
+        head: { ...remotePullRequest.head, sha: 'latest' },
+      };
+    }
+    assert.ok(url.endsWith('/compare/base...latest'));
+    return { behind_by: 0 };
+  });
+  const result = await updatePrBranch(
+    { githubKey: 'test-token', linearKey: '' },
+    pullRequest,
+  );
+  assert.equal(latestFetched, true);
+  assert.equal(result.status, 'up-to-date');
 });

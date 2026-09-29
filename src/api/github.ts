@@ -387,3 +387,21 @@ export async function closePr(credentials: Credentials, pr: PullRequest): Promis
     },
   );
 }
+
+/** Refresh branch information before using its head SHA for a guarded update. */
+export async function updatePrBranch(
+  credentials: Credentials,
+  pullRequest: PullRequest,
+): Promise<RebaseResult> {
+  const current = await requestGitHub<GitHubPullRequest>(
+    credentials.githubKey,
+    `/repos/${pullRequest.repo}/pulls/${pullRequest.number}`,
+  );
+  if (current.state !== 'open') {
+    return {
+      status: 'failed',
+      warning: `PR is ${current.state}; its branch was not updated.`,
+    };
+  }
+  return rebasePullRequest(credentials.githubKey, pullRequest.repo, current);
+}

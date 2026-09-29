@@ -175,6 +175,52 @@ async function attachedPrUrls(key, urls) {
   return linked;
 }
 
+// src/api/rebase.ts
+async function rebasePullRequest(token, repo, pullRequest) {
+  try {
+    if (pullRequest.mergeable === false) {
+      throw new Error("The branch has merge conflicts with its base.");
+    }
+    const comparison = await requestGitHub(
+      token,
+      `/repos/${repo}/compare/${pullRequest.base.sha}...${pullRequest.head.sha}`
+    );
+    if (!Number.isInteger(comparison.behind_by) || comparison.behind_by < 0) {
+      throw new Error("GitHub did not return the branch comparison.");
+    }
+    if (comparison.behind_by === 0) {
+      return { status: "up-to-date" };
+    }
+    const result = await requestJson(
+      "https://api.github.com/graphql",
+      "POST",
+      `Bearer ${token}`,
+      {
+        query: `mutation($input:UpdatePullRequestBranchInput!){updatePullRequestBranch(input:$input){clientMutationId}}`,
+        variables: {
+          input: {
+            pullRequestId: pullRequest.node_id,
+            expectedHeadOid: pullRequest.head.sha,
+            updateMethod: "REBASE"
+          }
+        }
+      }
+    );
+    if (result.errors?.length) {
+      throw new Error(result.errors.map((error) => error.message).join("; "));
+    }
+    if (!result.data?.updatePullRequestBranch) {
+      throw new Error("GitHub did not accept the branch rebase.");
+    }
+    return { status: "requested" };
+  } catch (error) {
+    return {
+      status: "failed",
+      warning: `Could not rebase: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
 // src/api/github.ts
 async function openRepoPulls(token, repo) {
   const pulls = [];
@@ -395,6 +441,11 @@ async function launchPr(credentials, pr) {
   if (data.state !== "open") {
     throw new Error(`Pull request is ${data.state}, not open.`);
   }
+  const rebase = await rebasePullRequest(credentials.githubKey, pr.repo, data);
+  const branchUpdate = {
+    rebaseStatus: rebase.status,
+    warnings: rebase.warning ? [rebase.warning] : []
+  };
   if (data.draft) {
     const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
     const ready = await requestJson(
@@ -411,7 +462,7 @@ async function launchPr(credentials, pr) {
     }
   }
   if (data.auto_merge) {
-    return { readyForReview: true, automergeEnabled: true };
+    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
   }
   const autoMergeQuery = `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}`;
   try {
@@ -426,11 +477,12 @@ async function launchPr(credentials, pr) {
         result.errors.map((e) => e.message).join("; ")
       );
     }
-    return { readyForReview: true, automergeEnabled: true };
+    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
   } catch (e) {
     return {
       readyForReview: true,
       automergeEnabled: false,
+      ...branchUpdate,
       error: `Ready for review, but auto-merge could not be enabled: ${e instanceof Error ? e.message : String(e)}`
     };
   }
@@ -1116,11 +1168,18 @@ var BoardView = class extends import_obsidian5.ItemView {
     this.render();
     let launched = 0;
     let readyOnly = 0;
+    let rebasesRequested = 0;
     const errors = [];
     try {
       for (const pullRequest of pullRequests) {
         try {
           const result = await launchPr(this.plugin.credentials(), pullRequest);
+          if (result.rebaseStatus === "requested") {
+            rebasesRequested++;
+          }
+          errors.push(
+            ...result.warnings.map((warning) => `${pullRequest.id}: ${warning}`)
+          );
           pullRequest.draft = !result.readyForReview;
           pullRequest.automerge = result.automergeEnabled;
           if (result.automergeEnabled) {
@@ -1136,7 +1195,7 @@ var BoardView = class extends import_obsidian5.ItemView {
         }
       }
       await this.plugin.saveMetadata();
-      const summary = `Launched ${launched}/${pullRequests.length} PRs${readyOnly ? `; ${readyOnly} ready without auto-merge` : ""}${errors.length ? `. ${errors.join("; ")}` : ""}`;
+      const summary = `Launched ${launched}/${pullRequests.length} PRs${rebasesRequested ? `; ${rebasesRequested} rebases requested` : ""}${readyOnly ? `; ${readyOnly} ready without auto-merge` : ""}${errors.length ? `. ${errors.join("; ")}` : ""}`;
       new import_obsidian5.Notice(summary, errors.length ? 1e4 : 4e3);
     } catch (e) {
       new import_obsidian5.Notice(errorMessage(e), 8e3);

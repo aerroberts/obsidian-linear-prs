@@ -19,6 +19,7 @@ export interface GitHubPullRequest {
   draft: boolean;
   created_at: string;
   head: { sha: string; ref: string };
+  base: { sha: string; ref: string };
   requested_reviewers?: GitHubUser[];
   auto_merge: object | null;
   mergeable: boolean | null;

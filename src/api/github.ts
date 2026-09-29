@@ -1,3 +1,4 @@
+import { rebasePullRequest, type RebaseResult } from './rebase';
 import { parsePullRequestUrl } from '../pull-request-matching';
 import type {
   GraphqlResponse,
@@ -288,10 +289,18 @@ export async function authoredOpenPrs(
   return prs;
 }
 
+export interface LaunchResult {
+  readyForReview: boolean;
+  automergeEnabled: boolean;
+  rebaseStatus: RebaseResult['status'];
+  warnings: string[];
+  error?: string;
+}
+
 export async function launchPr(
   credentials: Credentials,
   pr: PullRequest,
-): Promise<{ readyForReview: boolean; automergeEnabled: boolean; error?: string }> {
+): Promise<LaunchResult> {
   const data = await requestGitHub<GitHubPullRequest>(
     credentials.githubKey,
     `/repos/${pr.repo}/pulls/${pr.number}`,
@@ -299,6 +308,11 @@ export async function launchPr(
   if (data.state !== 'open') {
     throw new Error(`Pull request is ${data.state}, not open.`);
   }
+  const rebase = await rebasePullRequest(credentials.githubKey, pr.repo, data);
+  const branchUpdate = {
+    rebaseStatus: rebase.status,
+    warnings: rebase.warning ? [rebase.warning] : [],
+  };
   if (data.draft) {
     const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
     const ready = await requestJson<GraphqlResponse<ReadyForReviewResponse>>(
@@ -315,7 +329,7 @@ export async function launchPr(
     }
   }
   if (data.auto_merge) {
-    return { readyForReview: true, automergeEnabled: true };
+    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
   }
   const autoMergeQuery = `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}`;
   try {
@@ -330,11 +344,12 @@ export async function launchPr(
         result.errors.map((e: { message: string }) => e.message).join('; '),
       );
     }
-    return { readyForReview: true, automergeEnabled: true };
+    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
   } catch (e) {
     return {
       readyForReview: true,
       automergeEnabled: false,
+      ...branchUpdate,
       error: `Ready for review, but auto-merge could not be enabled: ${e instanceof Error ? e.message : String(e)}`,
     };
   }

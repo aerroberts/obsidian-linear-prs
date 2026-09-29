@@ -258,11 +258,18 @@ export class BoardView extends ItemView {
     this.render();
     let launched = 0;
     let readyOnly = 0;
+    let rebasesRequested = 0;
     const errors: string[] = [];
     try {
       for (const pullRequest of pullRequests) {
         try {
           const result = await launchPr(this.plugin.credentials(), pullRequest);
+          if (result.rebaseStatus === 'requested') {
+            rebasesRequested++;
+          }
+          errors.push(
+            ...result.warnings.map((warning) => `${pullRequest.id}: ${warning}`),
+          );
           pullRequest.draft = !result.readyForReview;
           pullRequest.automerge = result.automergeEnabled;
           if (result.automergeEnabled) {
@@ -278,7 +285,7 @@ export class BoardView extends ItemView {
         }
       }
       await this.plugin.saveMetadata();
-      const summary = `Launched ${launched}/${pullRequests.length} PRs${readyOnly ? `; ${readyOnly} ready without auto-merge` : ''}${errors.length ? `. ${errors.join('; ')}` : ''}`;
+      const summary = `Launched ${launched}/${pullRequests.length} PRs${rebasesRequested ? `; ${rebasesRequested} rebases requested` : ''}${readyOnly ? `; ${readyOnly} ready without auto-merge` : ''}${errors.length ? `. ${errors.join('; ')}` : ''}`;
       new Notice(summary, errors.length ? 10000 : 4000);
     } catch (e) {
       new Notice(errorMessage(e), 8000);

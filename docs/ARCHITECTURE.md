@@ -10,6 +10,7 @@ The API modules have separate responsibilities:
 - `responses.ts`: consumed GitHub response fields.
 - `linear.ts`: issue and attachment queries with pagination.
 - `github.ts`: pull request details, checks, reviewers, merge queues, and write actions.
+- `rebase.ts`: branch comparison and guarded GitHub rebase requests during launch.
 - `discovery.ts`: joins Linear issue trees and GitHub PRs, deduplicates results, and refreshes subsets.
 
 `src/pull-request-matching.ts` contains pure link and issue-reference matching. `src/async.ts` provides bounded workers and deadlines. A deadline stops waiting; it does not cancel an already dispatched HTTP request.

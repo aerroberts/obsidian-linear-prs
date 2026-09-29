@@ -1,3 +1,4 @@
+import { fetchSnapshots } from './snapshots';
 import { parsePullRequestUrl, referencedIdentifiers } from '../pull-request-matching';
 import type { GitHubPullRequest } from './responses';
 import type { Issue, PullRequest, Credentials } from '../types';
@@ -231,31 +232,8 @@ export async function refreshPrs(
   credentials: Credentials,
   previous: PullRequest[],
 ): Promise<PullRequest[]> {
-  const refreshed: PullRequest[] = [];
-  const errors: string[] = [];
-  await forEachConcurrent(previous, 4, async (old) => {
-    try {
-      const current = await fetchPullRequest(credentials.githubKey, old.repo, old.number);
-      if (current) {
-        refreshed.push({
-          ...current,
-          issueId: old.issueId,
-          issueTitle: old.issueTitle,
-          issueUrl: old.issueUrl,
-          groupId: old.groupId,
-          groupTitle: old.groupTitle,
-          groupUrl: old.groupUrl,
-        });
-      }
-    } catch (e) {
-      errors.push(`${old.id}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  });
-  if (errors.length) {
-    throw new Error(
-      `Pull request refresh failed: ${errors[0]}${errors.length > 1 ? ` (${errors.length} errors total)` : ''}`,
-    );
-  }
-  await markMergeQueued(credentials.githubKey, refreshed);
-  return refreshed;
+  const snapshots = await fetchSnapshots(credentials.githubKey, previous);
+  return snapshots
+    .map((snapshot) => snapshot.pullRequest)
+    .filter((pullRequest): pullRequest is PullRequest => pullRequest !== null);
 }

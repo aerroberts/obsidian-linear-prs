@@ -1,3 +1,4 @@
+import { fetchSnapshots } from '../src/api/snapshots';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { migrateMetadata, createEmptyMetadata } from '../src/metadata';
@@ -413,4 +414,151 @@ test('row branch refresh uses current GitHub state without ready or auto-merge m
   );
   assert.equal(latestFetched, true);
   assert.equal(result.status, 'up-to-date');
+});
+
+function connection<T>(nodes: T[] = []) {
+  return { nodes, pageInfo: { hasNextPage: false, endCursor: null as string | null } };
+}
+function graphSnapshot() {
+  return {
+    id: 'PR_42',
+    number: 42,
+    title: 'Updated title',
+    body: '',
+    url: remotePullRequest.html_url,
+    state: 'OPEN',
+    isDraft: true,
+    createdAt: remotePullRequest.created_at,
+    headRefOid: 'latest',
+    headRefName: 'fix/abc-123',
+    baseRefName: 'main',
+    baseRef: { target: { oid: 'base' } },
+    mergeable: 'MERGEABLE',
+    autoMergeRequest: { enabledAt: '2026-09-01' },
+    mergeQueueEntry: { id: 'queue' },
+    reviews: connection([
+      { author: { login: 'reviewer', __typename: 'User' }, state: 'APPROVED', body: '' },
+      {
+        author: { login: 'reviewer', __typename: 'User' },
+        state: 'COMMENTED',
+        body: 'Looks good',
+      },
+    ]),
+    reviewRequests: connection(),
+    comments: connection(),
+    reviewThreads: connection(),
+    statusCheckRollup: {
+      id: 'rollup',
+      contexts: connection([
+        {
+          __typename: 'CheckRun',
+          id: 'check',
+          name: 'Optional',
+          status: 'COMPLETED',
+          conclusion: 'SKIPPED',
+        },
+        { __typename: 'StatusContext', context: 'Deploy', state: 'PENDING' },
+        {
+          __typename: 'CheckRun',
+          id: 'lint',
+          name: 'Lint',
+          status: 'COMPLETED',
+          conclusion: 'FAILURE',
+          summary: 'Bad syntax',
+        },
+      ]),
+    },
+  };
+}
+
+test('batched status read preserves associations and normalizes badges in one request', async () => {
+  mockPullRequestDetails();
+  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  assert.ok(previous);
+  previous.groupId = 'linear-group';
+  previous.issueId = 'linear-issue';
+  let requests = 0;
+  mockRequests(({ body }) => {
+    requests++;
+    assert.ok(body?.includes('RefreshPullRequestSnapshots'));
+    return {
+      data: {
+        p0: { pullRequest: graphSnapshot() },
+        p1: { pullRequest: graphSnapshot() },
+      },
+    };
+  });
+  const snapshots = await fetchSnapshots('test-token', [
+    previous,
+    { ...previous, number: 43, id: 'owner/repo#43' },
+  ]);
+  assert.equal(requests, 1);
+  assert.equal(snapshots.length, 2);
+  const current = snapshots[0].pullRequest;
+  assert.ok(current);
+  assert.equal(current.groupId, 'linear-group');
+  assert.equal(current.issueId, 'linear-issue');
+  assert.equal(current.draft, true);
+  assert.equal(current.automerge, true);
+  assert.equal(current.mergeQueued, true);
+  assert.equal(current.comments, true);
+  assert.deepEqual(current.reviewers, [{ login: 'reviewer', status: 'approved' }]);
+  assert.deepEqual(
+    current.checks.map((check) => check.status),
+    ['success', 'pending', 'failure'],
+  );
+  assert.equal(current.checks[2].detail, 'Bad syntax');
+});
+
+test('snapshot errors reject rather than overwriting cached PRs with partial data', async () => {
+  mockPullRequestDetails();
+  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  assert.ok(previous);
+  mockRequests(() => ({ errors: [{ message: 'Not accessible' }], data: { p0: null } }));
+  await assert.rejects(fetchSnapshots('test-token', [previous]), /Not accessible/);
+});
+
+test('snapshots paginate additional reviews only when needed', async () => {
+  mockPullRequestDetails();
+  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  assert.ok(previous);
+  let requests = 0;
+  const snapshot = graphSnapshot();
+  snapshot.reviews.pageInfo = { hasNextPage: true, endCursor: 'next' };
+  mockRequests(({ body }) => {
+    requests++;
+    if (body?.includes('RefreshPullRequestSnapshots'))
+      return { data: { p0: { pullRequest: snapshot } } };
+    assert.equal(JSON.parse(body ?? '{}').variables.after, 'next');
+    return {
+      data: {
+        node: {
+          reviews: connection([
+            {
+              author: { login: 'reviewer', __typename: 'User' },
+              state: 'CHANGES_REQUESTED',
+              body: '',
+            },
+          ]),
+        },
+      },
+    };
+  });
+  const [result] = await fetchSnapshots('test-token', [previous]);
+  assert.equal(requests, 2);
+  assert.equal(result.pullRequest?.reviewers[0].status, 'changes_requested');
+});
+
+test('closed snapshots remove PRs and an empty refresh makes no requests', async () => {
+  mockPullRequestDetails();
+  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  assert.ok(previous);
+  let requests = 0;
+  mockRequests(() => {
+    requests++;
+    return { data: { p0: { pullRequest: { ...graphSnapshot(), state: 'MERGED' } } } };
+  });
+  assert.equal((await fetchSnapshots('test-token', [previous]))[0].pullRequest, null);
+  assert.deepEqual(await fetchSnapshots('test-token', []), []);
+  assert.equal(requests, 1);
 });

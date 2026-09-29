@@ -10,6 +10,7 @@ The API modules have separate responsibilities:
 - `responses.ts`: consumed GitHub response fields.
 - `linear.ts`: issue and attachment queries with pagination.
 - `github.ts`: pull request details, checks, reviewers, merge queues, and write actions.
+- `snapshots.ts`: batched GitHub GraphQL status reads, with pagination only when a connection has more results. Row and scoped refreshes use these snapshots and preserve Linear associations.
 - `rebase.ts`: branch comparison and guarded GitHub rebase requests during launch.
 - `discovery.ts`: joins Linear issue trees and GitHub PRs, deduplicates results, and refreshes subsets.
 
@@ -18,3 +19,5 @@ The API modules have separate responsibilities:
 `src/ui/board-view.ts` owns transient view state and rendering. Toolbar, groups, staging sections, row actions, and row metadata have separate rendering methods. `src/ui/elements.ts` contains DOM helpers; `src/ui/pull-request-badges.ts` renders status badges.
 
 Tests bundle with esbuild and mock only Obsidian's HTTP boundary. They run without an Obsidian install or live credentials. Production bundles leave Obsidian external. `styles.css` is generated from `src/styles.source.css`.
+
+Row refresh reads one snapshot, updates the branch if possible, and reads again only after an attempted update. Rebase verification waits for a changed head before repeating the base comparison. Bulk launch uses three concurrent workers and reuses the verified remote PR response.

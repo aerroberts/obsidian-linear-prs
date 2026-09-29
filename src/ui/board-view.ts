@@ -1,3 +1,4 @@
+import { forEachConcurrent } from '../async';
 import { renderPullRequestBadges } from './pull-request-badges';
 import type { WorkspaceLeaf } from 'obsidian';
 import { ItemView, Notice, Platform, Scope } from 'obsidian';
@@ -261,7 +262,7 @@ export class BoardView extends ItemView {
     let rebasesCompleted = 0;
     const errors: string[] = [];
     try {
-      for (const pullRequest of pullRequests) {
+      await forEachConcurrent(pullRequests, 3, async (pullRequest) => {
         try {
           const result = await launchPr(this.plugin.credentials(), pullRequest);
           if (result.rebaseStatus === 'updated') {
@@ -283,7 +284,7 @@ export class BoardView extends ItemView {
         } catch (e) {
           errors.push(`${pullRequest.repo}#${pullRequest.number}: ${errorMessage(e)}`);
         }
-      }
+      });
       try {
         await this.plugin.refreshSelectedPrs(pullRequests);
       } catch (error) {

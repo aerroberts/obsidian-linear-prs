@@ -1,6 +1,8 @@
+import { fetchSnapshots } from './api/snapshots';
+import { rebasePullRequest } from './api/rebase';
 import { Plugin, Notice } from 'obsidian';
 import { discover, discoverGroup, refreshPrs } from './api/discovery';
-import { markMergeQueued, updatePrBranch } from './api/github';
+import { markMergeQueued } from './api/github';
 import type { PullRequest } from './types';
 import {
   BOARD_VIEW_TYPE,
@@ -156,12 +158,30 @@ export default class LinearPrsPlugin extends Plugin {
     return result;
   }
   async refreshPullRequest(pullRequest: PullRequest) {
-    const refreshed = await this.refreshSelectedPrs([pullRequest]);
-    if (!refreshed.length) {
-      return undefined;
+    if (!this.settings.githubKey) {
+      throw new Error('Enter a GitHub API key in Linear PRs settings.');
     }
-    const branchUpdate = await updatePrBranch(this.credentials(), refreshed[0]);
-    await this.refreshSelectedPrs(refreshed);
+    const [snapshot] = await fetchSnapshots(this.settings.githubKey, [pullRequest]);
+    const branchUpdate = snapshot.pullRequest
+      ? await rebasePullRequest(
+          this.settings.githubKey,
+          pullRequest.repo,
+          snapshot.remote,
+        )
+      : undefined;
+    // An unchanged branch needs no second status read. A rejected update may have
+    // changed remotely before verification failed, so refresh that case too.
+    const latest =
+      branchUpdate && branchUpdate.status !== 'up-to-date'
+        ? (await fetchSnapshots(this.settings.githubKey, [pullRequest]))[0]
+        : snapshot;
+    this.metadata.pullRequests = this.metadata.pullRequests.filter(
+      (pr) => pr.id !== pullRequest.id,
+    );
+    if (latest.pullRequest) {
+      this.metadata.pullRequests.push(latest.pullRequest);
+    }
+    await this.saveMetadata();
     return branchUpdate;
   }
 

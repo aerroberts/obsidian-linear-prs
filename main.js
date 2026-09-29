@@ -23,21 +23,6 @@ __export(main_exports, {
   default: () => LinearPrsPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian6 = require("obsidian");
-
-// src/pull-request-matching.ts
-var prPattern = /https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/i;
-function parsePullRequestUrl(url) {
-  const m = url.match(prPattern);
-  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
-}
-function referencedIdentifiers(pr) {
-  return [
-    ...new Set(
-      ([pr.title ?? "", pr.body ?? "", pr.head?.ref ?? ""].join("\n").match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi) ?? []).map((id) => id.toUpperCase())
-    )
-  ];
-}
 
 // src/api/transport.ts
 var import_obsidian = require("obsidian");
@@ -82,97 +67,253 @@ async function requestGitHub(token, path, method = "GET", body) {
   return requestJson(`https://api.github.com${path}`, method, `Bearer ${token}`, body);
 }
 
-// src/api/linear.ts
-var ISSUE_FIELDS = "id identifier title url state { type } project { id name url } parent { id title url }";
-var PAGE = "pageInfo { hasNextPage endCursor }";
-async function assignedRoots(key) {
-  const roots = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($after:String){viewer{assignedIssues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE}}}}`,
-      { after }
-    );
-    const page = data.viewer.assignedIssues;
-    roots.push(
-      ...page.nodes.filter(
-        (i) => !["completed", "canceled"].includes(i.state?.type ?? "")
-      )
-    );
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return roots;
-}
-async function issueChildren(key, id) {
-  const children = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($id:String!,$after:String){issue(id:$id){children(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE}}}}`,
-      { id, after }
-    );
-    const page = data.issue.children;
-    children.push(...page.nodes);
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return children;
-}
-async function projectIssues(key, id) {
-  const issues = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($id:String!,$after:String){project(id:$id){issues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE}}}}`,
-      { id, after }
-    );
-    const page = data.project.issues;
-    issues.push(...page.nodes);
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return issues;
-}
-async function issueById(key, id) {
-  const data = await queryLinear(
-    key,
-    `query($id:String!){issue(id:$id){${ISSUE_FIELDS}}}`,
-    { id }
-  );
-  return data.issue;
-}
-async function attachmentUrls(key, id) {
-  const urls = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($id:String!,$after:String){issue(id:$id){attachments(first:100,after:$after){nodes{url} ${PAGE}}}}`,
-      { id, after }
-    );
-    const page = data.issue.attachments;
-    urls.push(...page.nodes.map((n) => n.url));
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return urls;
-}
-async function attachedPrUrls(key, urls) {
-  const linked = /* @__PURE__ */ new Set();
-  for (let start = 0; start < urls.length; start += 20) {
-    const batch = urls.slice(start, start + 20);
-    const fields = batch.map((url, i) => `a${i}:attachmentsForURL(url:${JSON.stringify(url)}){nodes{id}}`).join(" ");
-    const data = await queryLinear(
-      key,
-      `query{${fields}}`
-    );
-    batch.forEach((url, i) => {
-      if (data[`a${i}`]?.nodes.length) {
-        linked.add(url);
+// src/async.ts
+async function forEachConcurrent(items, limit, fn) {
+  let index = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (index < items.length) {
+        const item = items[index++];
+        await fn(item);
       }
+    })
+  );
+}
+async function withDeadline(task, milliseconds, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      task,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out. Try again.`)),
+          milliseconds
+        );
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// src/api/snapshots.ts
+var PAGE = "pageInfo { hasNextPage endCursor }";
+var ACTOR = "author { login __typename }";
+var CHECK_FIELDS = `__typename
+  ... on CheckRun { id name status conclusion title summary text
+    annotations(first:10) { nodes { annotationLevel message path } ${PAGE} } }
+  ... on StatusContext { context state description }`;
+var FIELDS = `id number title body url state isDraft createdAt headRefOid headRefName
+  baseRefName baseRef { target { oid } } mergeable autoMergeRequest { enabledAt }
+  mergeQueueEntry { id }
+  reviews(first:100) { nodes { ${ACTOR} state body } ${PAGE} }
+  reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } } } ${PAGE} }
+  comments(first:100) { nodes { ${ACTOR} } ${PAGE} }
+  reviewThreads(first:100) { nodes { id comments(first:10) { nodes { ${ACTOR} } ${PAGE} } } ${PAGE} }
+  statusCheckRollup { id contexts(first:100) { nodes { ${CHECK_FIELDS} } ${PAGE} } }`;
+async function graphql(token, query, variables) {
+  const result = await requestJson(
+    "https://api.github.com/graphql",
+    "POST",
+    `Bearer ${token}`,
+    { query, variables }
+  );
+  if (result.errors?.length) {
+    throw new Error(result.errors.map((error) => error.message).join("; "));
+  }
+  if (!result.data) {
+    throw new Error("GitHub returned no snapshot data.");
+  }
+  return result.data;
+}
+async function completeConnection(token, id, type, field, fields, connection) {
+  const nodes = [...connection.nodes];
+  let page = connection.pageInfo;
+  while (page.hasNextPage) {
+    if (!page.endCursor) {
+      throw new Error(`Missing GitHub cursor for ${field}.`);
+    }
+    const result = await graphql(
+      token,
+      `query($id:ID!,$after:String!){node(id:$id){... on ${type}{${field}(first:100,after:$after){nodes{${fields}} ${PAGE}}}}}`,
+      { id, after: page.endCursor }
+    );
+    const next = result.node[field];
+    nodes.push(...next.nodes);
+    page = next.pageInfo;
+  }
+  return nodes;
+}
+async function fetchSnapshots(token, previous) {
+  const snapshots = [];
+  for (let start = 0; start < previous.length; start += 10) {
+    const batch = previous.slice(start, start + 10);
+    const fields = batch.map((pr, index) => {
+      const [owner, name] = pr.repo.split("/");
+      return `p${index}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequest(number:${pr.number}){${FIELDS}}}`;
+    }).join("\n");
+    const result = await graphql(
+      token,
+      `query RefreshPullRequestSnapshots {${fields}}`
+    );
+    await forEachConcurrent(batch, 4, async (previousPr) => {
+      const index = batch.indexOf(previousPr);
+      const snapshot = result[`p${index}`]?.pullRequest;
+      if (!snapshot) {
+        throw new Error(`GitHub did not return ${previousPr.id}.`);
+      }
+      snapshots.push(await normalizeSnapshot(token, previousPr, snapshot));
     });
   }
-  return linked;
+  return snapshots;
+}
+async function normalizeSnapshot(token, previous, snapshot) {
+  const remote = {
+    number: snapshot.number,
+    node_id: snapshot.id,
+    html_url: snapshot.url,
+    title: snapshot.title,
+    body: snapshot.body,
+    state: snapshot.state.toLowerCase(),
+    draft: snapshot.isDraft,
+    created_at: snapshot.createdAt,
+    head: { sha: snapshot.headRefOid, ref: snapshot.headRefName },
+    base: { sha: snapshot.baseRef?.target.oid ?? "", ref: snapshot.baseRefName },
+    auto_merge: snapshot.autoMergeRequest,
+    mergeable: snapshot.mergeable === "UNKNOWN" ? null : snapshot.mergeable === "MERGEABLE"
+  };
+  if (snapshot.state !== "OPEN") {
+    return { remote, pullRequest: null };
+  }
+  const [reviews, requests, comments, threads, contexts] = await Promise.all([
+    completeConnection(
+      token,
+      snapshot.id,
+      "PullRequest",
+      "reviews",
+      `${ACTOR} state body`,
+      snapshot.reviews
+    ),
+    completeConnection(
+      token,
+      snapshot.id,
+      "PullRequest",
+      "reviewRequests",
+      "requestedReviewer { __typename ... on User { login } ... on Bot { login } }",
+      snapshot.reviewRequests
+    ),
+    completeConnection(
+      token,
+      snapshot.id,
+      "PullRequest",
+      "comments",
+      ACTOR,
+      snapshot.comments
+    ),
+    completeConnection(
+      token,
+      snapshot.id,
+      "PullRequest",
+      "reviewThreads",
+      `id comments(first:10){nodes{${ACTOR}} ${PAGE}}`,
+      snapshot.reviewThreads
+    ),
+    snapshot.statusCheckRollup ? completeConnection(
+      token,
+      snapshot.statusCheckRollup.id,
+      "StatusCheckRollup",
+      "contexts",
+      CHECK_FIELDS,
+      snapshot.statusCheckRollup.contexts
+    ) : []
+  ]);
+  const reviewers = /* @__PURE__ */ new Map();
+  for (const review of reviews) {
+    if (!review.author || !["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(review.state)) {
+      continue;
+    }
+    const previousState = reviewers.get(review.author.login);
+    if (review.state === "COMMENTED" && previousState && previousState !== "commented") {
+      continue;
+    }
+    reviewers.set(review.author.login, review.state.toLowerCase());
+  }
+  for (const request of requests) {
+    if (request.requestedReviewer?.login && !reviewers.has(request.requestedReviewer.login)) {
+      reviewers.set(request.requestedReviewer.login, "requested");
+    }
+  }
+  let humanComments = comments.some((comment) => comment.author?.__typename === "User") || reviews.some(
+    (review) => review.author?.__typename === "User" && Boolean(review.body.trim())
+  );
+  await forEachConcurrent(threads, 4, async (thread) => {
+    if (humanComments) {
+      return;
+    }
+    const comments2 = await completeConnection(
+      token,
+      thread.id,
+      "PullRequestReviewThread",
+      "comments",
+      ACTOR,
+      thread.comments
+    );
+    if (comments2.some((comment) => comment.author?.__typename === "User")) {
+      humanComments = true;
+    }
+  });
+  const checks = [];
+  for (const context of contexts) {
+    const pending = context.__typename === "CheckRun" ? context.status !== "COMPLETED" : ["PENDING", "EXPECTED"].includes(context.state ?? "");
+    const success = context.__typename === "CheckRun" ? ["SUCCESS", "NEUTRAL", "SKIPPED"].includes(context.conclusion ?? "") : context.state === "SUCCESS";
+    const status = pending ? "pending" : success ? "success" : "failure";
+    let detail = [
+      context.title !== context.name ? context.title : "",
+      context.summary,
+      context.text,
+      context.description
+    ].filter(Boolean).join(" \u2014 ").replace(/\s+/g, " ").trim().slice(0, 240);
+    if (status === "failure" && !detail && context.annotations) {
+      const annotations = await completeConnection(
+        token,
+        context.id ?? snapshot.id,
+        "CheckRun",
+        "annotations",
+        "annotationLevel message path",
+        context.annotations
+      );
+      const failure = annotations.find(
+        (annotation) => annotation.annotationLevel === "FAILURE"
+      );
+      if (failure) {
+        detail = `${failure.path}: ${failure.message}`.replace(/\s+/g, " ").slice(0, 240);
+      }
+    }
+    checks.push({
+      name: context.name ?? context.context ?? "Check",
+      status,
+      detail: status === "failure" ? detail || context.conclusion?.toLowerCase().replace(/_/g, " ") : void 0
+    });
+  }
+  return {
+    remote,
+    pullRequest: {
+      ...previous,
+      title: snapshot.title,
+      url: snapshot.url,
+      draft: snapshot.isDraft,
+      state: snapshot.isDraft ? "draft" : "open",
+      createdAt: snapshot.createdAt,
+      automerge: Boolean(snapshot.autoMergeRequest),
+      mergeQueued: Boolean(snapshot.mergeQueueEntry),
+      conflicts: snapshot.mergeable === "CONFLICTING",
+      reviewers: [...reviewers].map(([login, status]) => ({ login, status })),
+      checks,
+      comments: humanComments
+    }
+  };
 }
 
 // src/api/rebase.ts
@@ -220,9 +361,11 @@ async function rebasePullRequest(token, repo, pullRequest, options = {}) {
           `PR became ${current.state} before the rebase could be verified.`
         );
       }
-      const comparison2 = await compareWithCurrentBase(token, repo, current);
-      if (current.head.sha !== pullRequest.head.sha && comparison2.behind_by === 0) {
-        return { status: "updated" };
+      if (current.head.sha !== pullRequest.head.sha) {
+        const comparison2 = await compareWithCurrentBase(token, repo, current);
+        if (comparison2.behind_by === 0) {
+          return { status: "updated", remote: current };
+        }
       }
       if (attempt + 1 < attempts) {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
@@ -250,6 +393,116 @@ async function compareWithCurrentBase(token, repo, pullRequest) {
     token,
     `/repos/${repo}/compare/${base.object.sha}...${pullRequest.head.sha}`
   );
+}
+
+// src/main.ts
+var import_obsidian6 = require("obsidian");
+
+// src/pull-request-matching.ts
+var prPattern = /https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/i;
+function parsePullRequestUrl(url) {
+  const m = url.match(prPattern);
+  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
+}
+function referencedIdentifiers(pr) {
+  return [
+    ...new Set(
+      ([pr.title ?? "", pr.body ?? "", pr.head?.ref ?? ""].join("\n").match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi) ?? []).map((id) => id.toUpperCase())
+    )
+  ];
+}
+
+// src/api/linear.ts
+var ISSUE_FIELDS = "id identifier title url state { type } project { id name url } parent { id title url }";
+var PAGE2 = "pageInfo { hasNextPage endCursor }";
+async function assignedRoots(key) {
+  const roots = [];
+  let after = null;
+  do {
+    const data = await queryLinear(
+      key,
+      `query($after:String){viewer{assignedIssues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE2}}}}`,
+      { after }
+    );
+    const page = data.viewer.assignedIssues;
+    roots.push(
+      ...page.nodes.filter(
+        (i) => !["completed", "canceled"].includes(i.state?.type ?? "")
+      )
+    );
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return roots;
+}
+async function issueChildren(key, id) {
+  const children = [];
+  let after = null;
+  do {
+    const data = await queryLinear(
+      key,
+      `query($id:String!,$after:String){issue(id:$id){children(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE2}}}}`,
+      { id, after }
+    );
+    const page = data.issue.children;
+    children.push(...page.nodes);
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return children;
+}
+async function projectIssues(key, id) {
+  const issues = [];
+  let after = null;
+  do {
+    const data = await queryLinear(
+      key,
+      `query($id:String!,$after:String){project(id:$id){issues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE2}}}}`,
+      { id, after }
+    );
+    const page = data.project.issues;
+    issues.push(...page.nodes);
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return issues;
+}
+async function issueById(key, id) {
+  const data = await queryLinear(
+    key,
+    `query($id:String!){issue(id:$id){${ISSUE_FIELDS}}}`,
+    { id }
+  );
+  return data.issue;
+}
+async function attachmentUrls(key, id) {
+  const urls = [];
+  let after = null;
+  do {
+    const data = await queryLinear(
+      key,
+      `query($id:String!,$after:String){issue(id:$id){attachments(first:100,after:$after){nodes{url} ${PAGE2}}}}`,
+      { id, after }
+    );
+    const page = data.issue.attachments;
+    urls.push(...page.nodes.map((n) => n.url));
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return urls;
+}
+async function attachedPrUrls(key, urls) {
+  const linked = /* @__PURE__ */ new Set();
+  for (let start = 0; start < urls.length; start += 20) {
+    const batch = urls.slice(start, start + 20);
+    const fields = batch.map((url, i) => `a${i}:attachmentsForURL(url:${JSON.stringify(url)}){nodes{id}}`).join(" ");
+    const data = await queryLinear(
+      key,
+      `query{${fields}}`
+    );
+    batch.forEach((url, i) => {
+      if (data[`a${i}`]?.nodes.length) {
+        linked.add(url);
+      }
+    });
+  }
+  return linked;
 }
 
 // src/api/github.ts
@@ -478,10 +731,7 @@ async function launchPr(credentials, pr) {
     warnings: rebase.warning ? [rebase.warning] : []
   };
   if (rebase.status === "updated") {
-    data = await requestGitHub(
-      credentials.githubKey,
-      `/repos/${pr.repo}/pulls/${pr.number}`
-    );
+    data = rebase.remote ?? data;
     if (data.state !== "open") {
       throw new Error(`Pull request became ${data.state} after rebasing.`);
     }
@@ -544,50 +794,6 @@ async function closePr(credentials, pr) {
       state: "closed"
     }
   );
-}
-async function updatePrBranch(credentials, pullRequest) {
-  const current = await requestGitHub(
-    credentials.githubKey,
-    `/repos/${pullRequest.repo}/pulls/${pullRequest.number}`
-  );
-  if (current.state !== "open") {
-    return {
-      status: "failed",
-      warning: `PR is ${current.state}; its branch was not updated.`
-    };
-  }
-  return rebasePullRequest(credentials.githubKey, pullRequest.repo, current);
-}
-
-// src/async.ts
-async function forEachConcurrent(items, limit, fn) {
-  let index = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (index < items.length) {
-        const item = items[index++];
-        await fn(item);
-      }
-    })
-  );
-}
-async function withDeadline(task, milliseconds, label) {
-  let timer;
-  try {
-    return await Promise.race([
-      task,
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`${label} timed out. Try again.`)),
-          milliseconds
-        );
-      })
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
 }
 
 // src/api/discovery.ts
@@ -773,33 +979,8 @@ async function discoverGroup(credentials, groupId, groupUrl, knownRepos, knownIs
   return result;
 }
 async function refreshPrs(credentials, previous) {
-  const refreshed = [];
-  const errors = [];
-  await forEachConcurrent(previous, 4, async (old) => {
-    try {
-      const current = await fetchPullRequest(credentials.githubKey, old.repo, old.number);
-      if (current) {
-        refreshed.push({
-          ...current,
-          issueId: old.issueId,
-          issueTitle: old.issueTitle,
-          issueUrl: old.issueUrl,
-          groupId: old.groupId,
-          groupTitle: old.groupTitle,
-          groupUrl: old.groupUrl
-        });
-      }
-    } catch (e) {
-      errors.push(`${old.id}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  });
-  if (errors.length) {
-    throw new Error(
-      `Pull request refresh failed: ${errors[0]}${errors.length > 1 ? ` (${errors.length} errors total)` : ""}`
-    );
-  }
-  await markMergeQueued(credentials.githubKey, refreshed);
-  return refreshed;
+  const snapshots = await fetchSnapshots(credentials.githubKey, previous);
+  return snapshots.map((snapshot) => snapshot.pullRequest).filter((pullRequest) => pullRequest !== null);
 }
 
 // src/metadata.ts
@@ -1224,7 +1405,7 @@ var BoardView = class extends import_obsidian5.ItemView {
     let rebasesCompleted = 0;
     const errors = [];
     try {
-      for (const pullRequest of pullRequests) {
+      await forEachConcurrent(pullRequests, 3, async (pullRequest) => {
         try {
           const result = await launchPr(this.plugin.credentials(), pullRequest);
           if (result.rebaseStatus === "updated") {
@@ -1246,7 +1427,7 @@ var BoardView = class extends import_obsidian5.ItemView {
         } catch (e) {
           errors.push(`${pullRequest.repo}#${pullRequest.number}: ${errorMessage(e)}`);
         }
-      }
+      });
       try {
         await this.plugin.refreshSelectedPrs(pullRequests);
       } catch (error) {
@@ -1791,12 +1972,23 @@ var LinearPrsPlugin = class extends import_obsidian6.Plugin {
     return result;
   }
   async refreshPullRequest(pullRequest) {
-    const refreshed = await this.refreshSelectedPrs([pullRequest]);
-    if (!refreshed.length) {
-      return void 0;
+    if (!this.settings.githubKey) {
+      throw new Error("Enter a GitHub API key in Linear PRs settings.");
     }
-    const branchUpdate = await updatePrBranch(this.credentials(), refreshed[0]);
-    await this.refreshSelectedPrs(refreshed);
+    const [snapshot] = await fetchSnapshots(this.settings.githubKey, [pullRequest]);
+    const branchUpdate = snapshot.pullRequest ? await rebasePullRequest(
+      this.settings.githubKey,
+      pullRequest.repo,
+      snapshot.remote
+    ) : void 0;
+    const latest = branchUpdate && branchUpdate.status !== "up-to-date" ? (await fetchSnapshots(this.settings.githubKey, [pullRequest]))[0] : snapshot;
+    this.metadata.pullRequests = this.metadata.pullRequests.filter(
+      (pr) => pr.id !== pullRequest.id
+    );
+    if (latest.pullRequest) {
+      this.metadata.pullRequests.push(latest.pullRequest);
+    }
+    await this.saveMetadata();
     return branchUpdate;
   }
   credentials() {

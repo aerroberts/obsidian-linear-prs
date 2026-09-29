@@ -314,10 +314,7 @@ export async function launchPr(
     warnings: rebase.warning ? [rebase.warning] : [],
   };
   if (rebase.status === 'updated') {
-    data = await requestGitHub<GitHubPullRequest>(
-      credentials.githubKey,
-      `/repos/${pr.repo}/pulls/${pr.number}`,
-    );
+    data = rebase.remote ?? data;
     if (data.state !== 'open') {
       throw new Error(`Pull request became ${data.state} after rebasing.`);
     }

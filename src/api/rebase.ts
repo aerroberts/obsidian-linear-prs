@@ -4,6 +4,7 @@ import { requestGitHub, requestJson } from './transport';
 export interface RebaseResult {
   status: 'up-to-date' | 'updated' | 'failed';
   warning?: string;
+  remote?: GitHubPullRequest;
 }
 
 interface BranchUpdateResponse {
@@ -60,9 +61,11 @@ export async function rebasePullRequest(
           `PR became ${current.state} before the rebase could be verified.`,
         );
       }
-      const comparison = await compareWithCurrentBase(token, repo, current);
-      if (current.head.sha !== pullRequest.head.sha && comparison.behind_by === 0) {
-        return { status: 'updated' };
+      if (current.head.sha !== pullRequest.head.sha) {
+        const comparison = await compareWithCurrentBase(token, repo, current);
+        if (comparison.behind_by === 0) {
+          return { status: 'updated', remote: current };
+        }
       }
       if (attempt + 1 < attempts) {
         await new Promise((resolve) => setTimeout(resolve, intervalMs));

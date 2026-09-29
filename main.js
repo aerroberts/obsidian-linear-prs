@@ -176,15 +176,12 @@ async function attachedPrUrls(key, urls) {
 }
 
 // src/api/rebase.ts
-async function rebasePullRequest(token, repo, pullRequest) {
+async function rebasePullRequest(token, repo, pullRequest, options = {}) {
   try {
     if (pullRequest.mergeable === false) {
       throw new Error("The branch has merge conflicts with its base.");
     }
-    const comparison = await requestGitHub(
-      token,
-      `/repos/${repo}/compare/${pullRequest.base.sha}...${pullRequest.head.sha}`
-    );
+    const comparison = await compareWithCurrentBase(token, repo, pullRequest);
     if (!Number.isInteger(comparison.behind_by) || comparison.behind_by < 0) {
       throw new Error("GitHub did not return the branch comparison.");
     }
@@ -212,13 +209,47 @@ async function rebasePullRequest(token, repo, pullRequest) {
     if (!result.data?.updatePullRequestBranch) {
       throw new Error("GitHub did not accept the branch rebase.");
     }
-    return { status: "requested" };
+    const { attempts = 20, intervalMs = 1e3 } = options;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const current = await requestGitHub(
+        token,
+        `/repos/${repo}/pulls/${pullRequest.number}`
+      );
+      if (current.state !== "open") {
+        throw new Error(
+          `PR became ${current.state} before the rebase could be verified.`
+        );
+      }
+      const comparison2 = await compareWithCurrentBase(token, repo, current);
+      if (current.head.sha !== pullRequest.head.sha && comparison2.behind_by === 0) {
+        return { status: "updated" };
+      }
+      if (attempt + 1 < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+    }
+    throw new Error(
+      "GitHub accepted the rebase, but the branch update did not complete within the verification window. Retry Launch to check again."
+    );
   } catch (error) {
     return {
       status: "failed",
       warning: `Could not rebase: ${error instanceof Error ? error.message : String(error)}`
     };
   }
+}
+async function compareWithCurrentBase(token, repo, pullRequest) {
+  const base = await requestGitHub(
+    token,
+    `/repos/${repo}/git/ref/heads/${encodeURIComponent(pullRequest.base.ref)}`
+  );
+  if (!base.object?.sha) {
+    throw new Error("GitHub did not return the current base branch.");
+  }
+  return requestGitHub(
+    token,
+    `/repos/${repo}/compare/${base.object.sha}...${pullRequest.head.sha}`
+  );
 }
 
 // src/api/github.ts
@@ -434,7 +465,7 @@ async function authoredOpenPrs(token) {
   return prs;
 }
 async function launchPr(credentials, pr) {
-  const data = await requestGitHub(
+  let data = await requestGitHub(
     credentials.githubKey,
     `/repos/${pr.repo}/pulls/${pr.number}`
   );
@@ -446,6 +477,15 @@ async function launchPr(credentials, pr) {
     rebaseStatus: rebase.status,
     warnings: rebase.warning ? [rebase.warning] : []
   };
+  if (rebase.status === "updated") {
+    data = await requestGitHub(
+      credentials.githubKey,
+      `/repos/${pr.repo}/pulls/${pr.number}`
+    );
+    if (data.state !== "open") {
+      throw new Error(`Pull request became ${data.state} after rebasing.`);
+    }
+  }
   if (data.draft) {
     const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
     const ready = await requestJson(
@@ -1168,23 +1208,23 @@ var BoardView = class extends import_obsidian5.ItemView {
     this.render();
     let launched = 0;
     let readyOnly = 0;
-    let rebasesRequested = 0;
+    let rebasesCompleted = 0;
     const errors = [];
     try {
       for (const pullRequest of pullRequests) {
         try {
           const result = await launchPr(this.plugin.credentials(), pullRequest);
-          if (result.rebaseStatus === "requested") {
-            rebasesRequested++;
+          if (result.rebaseStatus === "updated") {
+            rebasesCompleted++;
           }
           errors.push(
             ...result.warnings.map((warning) => `${pullRequest.id}: ${warning}`)
           );
           pullRequest.draft = !result.readyForReview;
           pullRequest.automerge = result.automergeEnabled;
-          if (result.automergeEnabled) {
+          if (result.automergeEnabled && result.rebaseStatus !== "failed") {
             launched++;
-          } else {
+          } else if (!result.automergeEnabled) {
             readyOnly++;
             errors.push(
               `${pullRequest.repo}#${pullRequest.number}: ${result.error ?? "Ready for review, but auto-merge is disabled."}`
@@ -1194,9 +1234,14 @@ var BoardView = class extends import_obsidian5.ItemView {
           errors.push(`${pullRequest.repo}#${pullRequest.number}: ${errorMessage(e)}`);
         }
       }
+      try {
+        await this.plugin.refreshSelectedPrs(pullRequests);
+      } catch (error) {
+        errors.push(`Could not refresh launched PRs: ${errorMessage(error)}`);
+      }
       await this.plugin.saveMetadata();
-      const summary = `Launched ${launched}/${pullRequests.length} PRs${rebasesRequested ? `; ${rebasesRequested} rebases requested` : ""}${readyOnly ? `; ${readyOnly} ready without auto-merge` : ""}${errors.length ? `. ${errors.join("; ")}` : ""}`;
-      new import_obsidian5.Notice(summary, errors.length ? 1e4 : 4e3);
+      const summary = `Launched ${launched}/${pullRequests.length} PRs${rebasesCompleted ? `; ${rebasesCompleted} branches rebased` : ""}${readyOnly ? `; ${readyOnly} ready without auto-merge` : ""}${errors.length ? `. ${errors.join("; ")}` : ""}`;
+      new import_obsidian5.Notice(summary, errors.length ? 0 : 8e3);
     } catch (e) {
       new import_obsidian5.Notice(errorMessage(e), 8e3);
     } finally {

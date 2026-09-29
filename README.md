@@ -22,4 +22,4 @@ Run `npm ci`, `npm run check`, and `npm run build`. Use `npm run format` to appl
 
 Read the [code style](docs/CODE_STYLE.md), [architecture](docs/ARCHITECTURE.md), and [PR guidelines](docs/PR_STYLE.md) before contributing. Regression tests use mocked HTTP responses and do not access live accounts.
 
-Launch uses GitHub’s branch update API with the rebase method. Branches already up to date are skipped. Conflicts, permissions, or rejected rebases appear in the launch notice while the remaining launch actions continue. A reported rebase request means GitHub accepted the asynchronous update, not that it has completed.
+Launch uses GitHub’s branch update API with the rebase method. It compares against the current base branch and verifies that the PR’s head changes and is no longer behind before reporting a completed rebase. Branches already up to date are skipped. Conflicts, permissions, or uncompleted rebases appear in a persistent launch notice while the remaining launch actions continue. A failed rebase is excluded from the successful launch count.

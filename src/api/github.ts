@@ -301,7 +301,7 @@ export async function launchPr(
   credentials: Credentials,
   pr: PullRequest,
 ): Promise<LaunchResult> {
-  const data = await requestGitHub<GitHubPullRequest>(
+  let data = await requestGitHub<GitHubPullRequest>(
     credentials.githubKey,
     `/repos/${pr.repo}/pulls/${pr.number}`,
   );
@@ -313,6 +313,15 @@ export async function launchPr(
     rebaseStatus: rebase.status,
     warnings: rebase.warning ? [rebase.warning] : [],
   };
+  if (rebase.status === 'updated') {
+    data = await requestGitHub<GitHubPullRequest>(
+      credentials.githubKey,
+      `/repos/${pr.repo}/pulls/${pr.number}`,
+    );
+    if (data.state !== 'open') {
+      throw new Error(`Pull request became ${data.state} after rebasing.`);
+    }
+  }
   if (data.draft) {
     const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
     const ready = await requestJson<GraphqlResponse<ReadyForReviewResponse>>(

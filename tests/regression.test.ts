@@ -4,12 +4,18 @@ import { migrateMetadata, createEmptyMetadata } from '../src/metadata';
 import { parsePullRequestUrl, referencedIdentifiers } from '../src/pull-request-matching';
 import { forEachConcurrent, withDeadline } from '../src/async';
 import { fetchPullRequest, launchPr, markMergeQueued } from '../src/api/github';
+import { rebasePullRequest } from '../src/api/rebase';
 
-function mockRequests(handler: (options: { url: string; body?: string }) => unknown) {
+function mockRequests(
+  handler: (options: { url: string; body?: string }) => unknown,
+  options: { baseSha?: string } = {},
+) {
   Object.assign(globalThis, {
-    requestMock: async (options: { url: string; body?: string }) => ({
+    requestMock: async (request: { url: string; body?: string }) => ({
       status: 200,
-      json: handler(options),
+      json: request.url.includes('/git/ref/heads/')
+        ? { object: { sha: options.baseSha ?? 'base' } }
+        : handler(request),
       text: '',
     }),
   });
@@ -184,16 +190,23 @@ test('launch reports ready status when GitHub refuses auto-merge', async () => {
   assert.match(result.error ?? '', /Auto-merge disabled/);
 });
 
-test('launch requests a guarded rebase before ready and auto-merge', async () => {
+test('launch verifies a guarded rebase before ready and auto-merge', async () => {
   mockPullRequestDetails();
   const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
   assert.ok(pullRequest);
   const actions: string[] = [];
   mockRequests(({ url, body }) => {
-    if (url.endsWith('/pulls/42')) return { ...remotePullRequest, draft: true };
+    if (url.endsWith('/pulls/42'))
+      return {
+        ...remotePullRequest,
+        draft: true,
+        head: {
+          ...remotePullRequest.head,
+          sha: actions.includes('rebase') ? 'rebased' : 'abc',
+        },
+      };
     if (url.includes('/compare/')) {
-      assert.ok(url.endsWith('/compare/base...abc'));
-      return { behind_by: 2 };
+      return { behind_by: url.endsWith('...rebased') ? 0 : 2 };
     }
     if (body?.includes('updatePullRequestBranch')) {
       const payload = JSON.parse(body);
@@ -216,7 +229,7 @@ test('launch requests a guarded rebase before ready and auto-merge', async () =>
   });
   const result = await launchPr({ githubKey: 'test-token', linearKey: '' }, pullRequest);
   assert.deepEqual(actions, ['rebase', 'ready', 'auto-merge']);
-  assert.equal(result.rebaseStatus, 'requested');
+  assert.equal(result.rebaseStatus, 'updated');
   assert.equal(result.automergeEnabled, true);
   assert.deepEqual(result.warnings, []);
 });
@@ -242,8 +255,13 @@ test('launch attempts rebasing even when auto-merge is already enabled', async (
   assert.ok(pullRequest);
   let requested = false;
   mockRequests(({ url, body }) => {
-    if (url.endsWith('/pulls/42')) return { ...remotePullRequest, auto_merge: {} };
-    if (url.includes('/compare/')) return { behind_by: 1 };
+    if (url.endsWith('/pulls/42'))
+      return {
+        ...remotePullRequest,
+        auto_merge: {},
+        head: { ...remotePullRequest.head, sha: requested ? 'rebased' : 'abc' },
+      };
+    if (url.includes('/compare/')) return { behind_by: requested ? 0 : 1 };
     assert.ok(body?.includes('updatePullRequestBranch'));
     requested = true;
     return { data: { updatePullRequestBranch: { clientMutationId: null } } };
@@ -304,4 +322,64 @@ test('closed PRs never trigger a rebase or launch mutation', async () => {
     /not open/,
   );
   assert.equal(requests, 1);
+});
+
+test('rebase compares against the live base tip instead of the PR snapshot', async () => {
+  let updated = false;
+  mockRequests(
+    ({ url, body }) => {
+      if (url.includes('/compare/')) {
+        assert.ok(url.includes('/compare/current-base...'));
+        return { behind_by: updated ? 0 : 26 };
+      }
+      if (body) {
+        updated = true;
+        return { data: { updatePullRequestBranch: { clientMutationId: null } } };
+      }
+      return {
+        ...remotePullRequest,
+        head: { ...remotePullRequest.head, sha: 'rebased' },
+      };
+    },
+    { baseSha: 'current-base' },
+  );
+  const result = await rebasePullRequest('test-token', 'owner/repo', remotePullRequest, {
+    attempts: 2,
+    intervalMs: 0,
+  });
+  assert.equal(updated, true);
+  assert.equal(result.status, 'updated');
+});
+
+test('an accepted mutation with an unchanged branch is reported as failure', async () => {
+  mockRequests(({ url, body }) => {
+    if (url.includes('/compare/')) return { behind_by: 2 };
+    if (body) return { data: { updatePullRequestBranch: { clientMutationId: null } } };
+    return remotePullRequest;
+  });
+  const result = await rebasePullRequest('test-token', 'owner/repo', remotePullRequest, {
+    attempts: 2,
+    intervalMs: 0,
+  });
+  assert.equal(result.status, 'failed');
+  assert.match(result.warning ?? '', /did not complete/);
+});
+
+test('verification waits for asynchronous branch updates', async () => {
+  let reads = 0;
+  mockRequests(({ url, body }) => {
+    if (url.includes('/compare/')) return { behind_by: reads >= 2 ? 0 : 2 };
+    if (body) return { data: { updatePullRequestBranch: { clientMutationId: null } } };
+    reads++;
+    return {
+      ...remotePullRequest,
+      head: { ...remotePullRequest.head, sha: reads >= 2 ? 'rebased' : 'abc' },
+    };
+  });
+  const result = await rebasePullRequest('test-token', 'owner/repo', remotePullRequest, {
+    attempts: 3,
+    intervalMs: 0,
+  });
+  assert.equal(reads, 2);
+  assert.equal(result.status, 'updated');
 });

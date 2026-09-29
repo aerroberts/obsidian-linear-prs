@@ -258,23 +258,23 @@ export class BoardView extends ItemView {
     this.render();
     let launched = 0;
     let readyOnly = 0;
-    let rebasesRequested = 0;
+    let rebasesCompleted = 0;
     const errors: string[] = [];
     try {
       for (const pullRequest of pullRequests) {
         try {
           const result = await launchPr(this.plugin.credentials(), pullRequest);
-          if (result.rebaseStatus === 'requested') {
-            rebasesRequested++;
+          if (result.rebaseStatus === 'updated') {
+            rebasesCompleted++;
           }
           errors.push(
             ...result.warnings.map((warning) => `${pullRequest.id}: ${warning}`),
           );
           pullRequest.draft = !result.readyForReview;
           pullRequest.automerge = result.automergeEnabled;
-          if (result.automergeEnabled) {
+          if (result.automergeEnabled && result.rebaseStatus !== 'failed') {
             launched++;
-          } else {
+          } else if (!result.automergeEnabled) {
             readyOnly++;
             errors.push(
               `${pullRequest.repo}#${pullRequest.number}: ${result.error ?? 'Ready for review, but auto-merge is disabled.'}`,
@@ -284,9 +284,14 @@ export class BoardView extends ItemView {
           errors.push(`${pullRequest.repo}#${pullRequest.number}: ${errorMessage(e)}`);
         }
       }
+      try {
+        await this.plugin.refreshSelectedPrs(pullRequests);
+      } catch (error) {
+        errors.push(`Could not refresh launched PRs: ${errorMessage(error)}`);
+      }
       await this.plugin.saveMetadata();
-      const summary = `Launched ${launched}/${pullRequests.length} PRs${rebasesRequested ? `; ${rebasesRequested} rebases requested` : ''}${readyOnly ? `; ${readyOnly} ready without auto-merge` : ''}${errors.length ? `. ${errors.join('; ')}` : ''}`;
-      new Notice(summary, errors.length ? 10000 : 4000);
+      const summary = `Launched ${launched}/${pullRequests.length} PRs${rebasesCompleted ? `; ${rebasesCompleted} branches rebased` : ''}${readyOnly ? `; ${readyOnly} ready without auto-merge` : ''}${errors.length ? `. ${errors.join('; ')}` : ''}`;
+      new Notice(summary, errors.length ? 0 : 8000);
     } catch (e) {
       new Notice(errorMessage(e), 8000);
     } finally {

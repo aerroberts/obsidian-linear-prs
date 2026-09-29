@@ -2,7 +2,7 @@
 
 `src/main.ts` registers the plugin, loads settings and metadata, and coordinates refreshes. `src/preferences.ts` owns the settings tab.
 
-`src/types.ts` describes Linear issues and normalized pull requests. `src/metadata.ts` owns board state, defaults, and migration. The existing `reviewTypes` key remains stable on disk, with values `none`, `A`, `B`, and `C`.
+`src/types.ts` describes Linear issues and normalized pull requests. `src/metadata.ts` owns board state, defaults, and migration. The existing `reviewTypes` key remains stable on disk, with values `none`, `A`, `B`, `C`, and `D`.
 
 The API modules have separate responsibilities:
 

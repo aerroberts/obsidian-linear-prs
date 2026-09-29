@@ -61,6 +61,21 @@ async function issueChildren(key, id) {
   } while (after);
   return children;
 }
+async function projectIssues(key, id) {
+  const issues = [];
+  let after = null;
+  do {
+    const data = await linear(key, `query($id:String!,$after:String){project(id:$id){issues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE}}}}`, { id, after });
+    const page = data.project.issues;
+    issues.push(...page.nodes);
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return issues;
+}
+async function issueById(key, id) {
+  const data = await linear(key, `query($id:String!){issue(id:$id){${ISSUE_FIELDS}}}`, { id });
+  return data.issue;
+}
 async function attachmentUrls(key, id) {
   const urls = [];
   let after = null;
@@ -80,17 +95,17 @@ function parsePr(url) {
 async function gh(token, path, method = "GET", body) {
   return json(`https://api.github.com${path}`, method, `Bearer ${token}`, body);
 }
-async function githubSearch(token, identifier) {
-  const found = [];
-  for (let page = 1; page <= 10; page++) {
-    const data = await gh(token, `/search/issues?q=${encodeURIComponent(`"${identifier}" type:pr state:open`)}&per_page=100&page=${page}`);
-    for (const item of data.items ?? []) {
-      const parsed = parsePr(item.html_url);
-      if (parsed) found.push(parsed);
-    }
-    if ((data.items ?? []).length < 100) break;
+async function openRepoPulls(token, repo) {
+  const pulls = [];
+  for (let page = 1; ; page++) {
+    const batch = await gh(token, `/repos/${repo}/pulls?state=open&per_page=100&page=${page}`);
+    pulls.push(...batch);
+    if (batch.length < 100) break;
   }
-  return found;
+  return pulls;
+}
+function referencedIdentifiers(pr) {
+  return [...new Set(([pr.title ?? "", pr.body ?? "", pr.head?.ref ?? ""].join("\n").match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi) ?? []).map((id) => id.toUpperCase()))];
 }
 async function details(token, repo, number, issue, attached = true, prefetched) {
   const path = `/repos/${repo}/pulls/${number}`;
@@ -108,16 +123,37 @@ async function details(token, repo, number, issue, attached = true, prefetched) 
     gh(token, `/repos/${repo}/issues/${number}/comments?per_page=100`)
   ]);
   const reviewerMap = /* @__PURE__ */ new Map();
-  for (const r of reviews.status === "fulfilled" ? reviews.value : []) if (r.user?.login && ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(r.state)) reviewerMap.set(r.user.login, r.state.toLowerCase());
+  const reviewItems = reviews.status === "fulfilled" ? reviews.value : [];
+  for (const r of reviewItems) {
+    if (!r.user?.login || !["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(r.state)) continue;
+    const previous = reviewerMap.get(r.user.login);
+    if (r.state === "COMMENTED" && previous && previous !== "commented") continue;
+    reviewerMap.set(r.user.login, r.state.toLowerCase());
+  }
   for (const r of p.requested_reviewers ?? []) if (!reviewerMap.has(r.login)) reviewerMap.set(r.login, "requested");
   const checks = [];
-  if (checkRuns.status === "fulfilled") for (const c of checkRuns.value.check_runs ?? []) checks.push({ name: c.name, status: c.status !== "completed" ? "pending" : c.conclusion === "success" ? "success" : "failure" });
-  if (status.status === "fulfilled") for (const s of status.value.statuses ?? []) checks.push({ name: s.context, status: s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure" });
-  const hasHumanComments = [reviewComments, issueComments].some((result) => result.status === "fulfilled" && result.value.some((comment) => comment.user?.type === "User"));
+  const missingCheckDetails = [];
+  if (checkRuns.status === "fulfilled") for (const c of checkRuns.value.check_runs ?? []) {
+    const state = c.status !== "completed" ? "pending" : ["success", "neutral", "skipped"].includes(c.conclusion) ? "success" : "failure";
+    const output = [c.conclusion && c.conclusion !== "failure" ? String(c.conclusion).replace(/_/g, " ") : "", c.output?.title !== c.name ? c.output?.title : "", c.output?.summary, c.output?.text].filter(Boolean).join(" \u2014 ").replace(/\s+/g, " ").trim();
+    if (state === "failure" && !output && c.id) missingCheckDetails.push({ id: c.id, index: checks.length });
+    checks.push({ name: c.name, status: state, detail: state === "failure" ? output.slice(0, 240) : void 0 });
+  }
+  await Promise.allSettled(missingCheckDetails.slice(0, 8).map(async ({ id, index }) => {
+    const annotations = await gh(token, `/repos/${repo}/check-runs/${id}/annotations?per_page=100`);
+    const failures = annotations.filter((annotation) => annotation.annotation_level === "failure");
+    const first = failures[0];
+    if (first) checks[index].detail = [first.path && first.start_line ? `${first.path}:${first.start_line}` : "", first.message].filter(Boolean).join(" \u2014 ").replace(/\s+/g, " ").trim().slice(0, 240);
+  }));
+  if (status.status === "fulfilled") for (const s of status.value.statuses ?? []) {
+    const state = s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure";
+    checks.push({ name: s.context, status: state, detail: state === "failure" ? String(s.description ?? "").replace(/\s+/g, " ").trim().slice(0, 240) : void 0 });
+  }
+  const hasHumanComment = [reviewComments, issueComments].some((result) => result.status === "fulfilled" && result.value.some((comment) => comment.user?.type === "User")) || reviewItems.some((r) => r.user?.type === "User" && Boolean(r.body?.trim()));
   const groupId = issue ? issue.parent?.id ?? issue.project?.id ?? "unparented" : "unlinked";
   const groupTitle = issue ? issue.parent?.title ?? issue.project?.name ?? "Unparented issues" : "";
   const groupUrl = issue ? issue.parent?.url ?? issue.project?.url ?? "" : "";
-  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue?.id ?? "", issueTitle: issue?.title, issueUrl: issue?.url, groupId, groupTitle, groupUrl, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, conflicts: p.mergeable === false, comments: hasHumanComments };
+  return { id: `${repo}#${number}`, url: p.html_url, repo, number, title: p.title, draft: p.draft, state: p.draft ? "draft" : "open", createdAt: p.created_at, issueId: issue?.id ?? "", issueTitle: issue?.title, issueUrl: issue?.url, groupId, groupTitle, groupUrl, checks, reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })), automerge: !!p.auto_merge, mergeQueued: false, conflicts: p.mergeable === false, comments: hasHumanComment };
 }
 async function mapLimit(items, limit, fn) {
   let index = 0;
@@ -127,6 +163,28 @@ async function mapLimit(items, limit, fn) {
       await fn(item);
     }
   }));
+}
+async function markMergeQueued(token, prs) {
+  for (let start = 0; start < prs.length; start += 50) {
+    const batch = prs.slice(start, start + 50);
+    const byRepo = /* @__PURE__ */ new Map();
+    for (const pr of batch) {
+      const items = byRepo.get(pr.repo) ?? [];
+      items.push(pr);
+      byRepo.set(pr.repo, items);
+    }
+    const groups = [...byRepo];
+    const fields = groups.map(([repo, items], i) => {
+      const [owner, name] = repo.split("/");
+      const pulls = items.map((pr, j) => `p${j}:pullRequest(number:${pr.number}){mergeQueueEntry{id}}`).join(" ");
+      return `r${i}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${pulls}}`;
+    }).join(" ");
+    const response = await json("https://api.github.com/graphql", "POST", `Bearer ${token}`, { query: `query{${fields}}` });
+    if (response.errors?.length) throw new Error(`GitHub merge queue lookup: ${response.errors.map((e) => e.message).join("; ")}`);
+    groups.forEach(([, items], i) => items.forEach((pr, j) => {
+      pr.mergeQueued = !!response.data?.[`r${i}`]?.[`p${j}`]?.mergeQueueEntry;
+    }));
+  }
 }
 async function authoredOpenPrs(token) {
   const viewer = await gh(token, "/user");
@@ -138,7 +196,7 @@ async function authoredOpenPrs(token) {
     if (result.incomplete_results) throw new Error("GitHub returned incomplete pull request search results.");
     for (const item of result.items ?? []) {
       const ref = parsePr(item.html_url);
-      if (ref) prs.push({ ...ref, url: item.html_url });
+      if (ref) prs.push({ ...ref, url: item.html_url, draft: !!item.draft });
     }
     if ((result.items ?? []).length < 100) break;
     if (page === 10) throw new Error("GitHub search exceeded its 1,000 pull request result limit.");
@@ -157,24 +215,21 @@ async function attachedPrUrls(key, urls) {
   }
   return linked;
 }
-async function hasLinearIssueReference(key, pr, cache) {
-  const text = [pr.title, pr.body ?? "", pr.head?.ref ?? ""].join("\n");
-  const identifiers = [...new Set((text.match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi) ?? []).map((id) => id.toUpperCase()))];
-  for (const id of identifiers) {
-    let exists = cache.get(id);
-    if (exists === void 0) {
+async function referencedLinearIssue(key, pr, cache) {
+  for (const id of referencedIdentifiers(pr)) {
+    if (!cache.has(id)) {
       try {
-        const result = await linear(key, "query($id:String!){issue(id:$id){id}}", { id });
-        exists = !!result.issue;
+        const result = await linear(key, `query($id:String!){issue(id:$id){${ISSUE_FIELDS}}}`, { id });
+        cache.set(id, result.issue);
       } catch (e) {
         if (!String(e).includes("Entity not found: Issue")) throw e;
-        exists = false;
+        cache.set(id, null);
       }
-      cache.set(id, exists);
     }
-    if (exists) return true;
+    const issue = cache.get(id);
+    if (issue) return issue;
   }
-  return false;
+  return null;
 }
 async function discover(c) {
   const authoredOpen = await authoredOpenPrs(c.githubKey);
@@ -200,8 +255,28 @@ async function discover(c) {
     });
     frontier = next;
   }
+  const linked = await discoverLinked(c, issues, []);
+  const prs = linked.prs;
+  errors.push(...linked.errors);
+  const associatedIds = new Set(prs.map((pr) => pr.id));
+  const authored = authoredOpen.filter((pr) => !associatedIds.has(`${pr.repo}#${pr.number}`));
+  const attached = await attachedPrUrls(c.linearKey, authored.map((pr) => pr.url));
+  const issueRefs = /* @__PURE__ */ new Map();
+  await mapLimit(authored, 6, async (ref) => {
+    const pr = await gh(c.githubKey, `/repos/${ref.repo}/pulls/${ref.number}`);
+    if (pr.state !== "open") return;
+    const issue = await referencedLinearIssue(c.linearKey, pr, issueRefs);
+    if (attached.has(ref.url) && !issue && !pr.draft) return;
+    const item = await details(c.githubKey, ref.repo, ref.number, issue ?? void 0, true, pr);
+    if (item) prs.push(item);
+  });
+  await markMergeQueued(c.githubKey, prs);
+  return { prs, errors };
+}
+async function discoverLinked(c, issues, knownRepos) {
   const prs = [];
   const used = /* @__PURE__ */ new Set();
+  const errors = [];
   const refsByIssue = /* @__PURE__ */ new Map();
   const allowedRepos = /* @__PURE__ */ new Set();
   await mapLimit(issues, 6, async (issue) => {
@@ -219,16 +294,23 @@ async function discover(c) {
       errors.push(`${issue.identifier} attachments: ${String(e)}`);
     }
   });
-  await mapLimit(issues, 6, async (issue) => {
-    const refs = refsByIssue.get(issue.id);
+  for (const repo of knownRepos) allowedRepos.add(repo);
+  const issuesByIdentifier = new Map(issues.map((issue) => [issue.identifier.toUpperCase(), issue]));
+  await mapLimit([...allowedRepos], 3, async (repo) => {
     try {
-      for (const ref of await githubSearch(c.githubKey, issue.identifier)) {
-        const key = `${ref.repo}#${ref.number}`;
-        if (allowedRepos.has(ref.repo) && !refs.has(key)) refs.set(key, { ...ref, attached: false });
+      for (const pull of await openRepoPulls(c.githubKey, repo)) {
+        const issue = referencedIdentifiers(pull).map((id) => issuesByIdentifier.get(id)).find((match) => !!match);
+        if (!issue) continue;
+        const refs = refsByIssue.get(issue.id);
+        const key = `${repo}#${pull.number}`;
+        if (!refs.has(key)) refs.set(key, { repo, number: pull.number, attached: false });
       }
     } catch (e) {
-      errors.push(`${issue.identifier} search: ${String(e)}`);
+      errors.push(`${repo} pull request list: ${String(e)}`);
     }
+  });
+  await mapLimit(issues, 6, async (issue) => {
+    const refs = refsByIssue.get(issue.id);
     for (const ref of refs.values()) {
       const key = `${ref.repo}#${ref.number}`;
       if (used.has(key)) continue;
@@ -241,24 +323,57 @@ async function discover(c) {
       }
     }
   });
-  const associatedIds = new Set(prs.map((pr) => pr.id));
-  const authored = authoredOpen.filter((pr) => !associatedIds.has(`${pr.repo}#${pr.number}`));
-  const attached = await attachedPrUrls(c.linearKey, authored.map((pr) => pr.url));
-  const issueExists = /* @__PURE__ */ new Map();
-  await mapLimit(authored.filter((pr) => !attached.has(pr.url)), 6, async (ref) => {
-    const pr = await gh(c.githubKey, `/repos/${ref.repo}/pulls/${ref.number}`);
-    if (pr.state !== "open" || await hasLinearIssueReference(c.linearKey, pr, issueExists)) return;
-    const item = await details(c.githubKey, ref.repo, ref.number, void 0, true, pr);
-    if (item) prs.push(item);
-  });
   return { prs, errors };
+}
+async function discoverGroup(c, groupId, groupUrl, knownRepos, knownIssueIds) {
+  let issues;
+  if (groupUrl.includes("/project/")) issues = (await projectIssues(c.linearKey, groupId)).filter((issue) => !issue.parent);
+  else if (groupUrl.includes("/issue/")) issues = await issueChildren(c.linearKey, groupId);
+  else {
+    issues = [];
+    await mapLimit(knownIssueIds, 6, async (id) => {
+      const issue = await issueById(c.linearKey, id);
+      if (issue) issues.push(issue);
+    });
+  }
+  const result = await discoverLinked(c, issues, knownRepos);
+  result.prs = result.prs.filter((pr) => pr.groupId === groupId);
+  await markMergeQueued(c.githubKey, result.prs);
+  return result;
+}
+async function refreshPrs(c, previous) {
+  const refreshed = [];
+  const errors = [];
+  await mapLimit(previous, 4, async (old) => {
+    try {
+      const current = await details(c.githubKey, old.repo, old.number);
+      if (current) refreshed.push({ ...current, issueId: old.issueId, issueTitle: old.issueTitle, issueUrl: old.issueUrl, groupId: old.groupId, groupTitle: old.groupTitle, groupUrl: old.groupUrl });
+    } catch (e) {
+      errors.push(`${old.id}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
+  if (errors.length) throw new Error(`Pull request refresh failed: ${errors[0]}${errors.length > 1 ? ` (${errors.length} errors total)` : ""}`);
+  await markMergeQueued(c.githubKey, refreshed);
+  return refreshed;
 }
 async function launchPr(c, pr) {
   const data = await gh(c.githubKey, `/repos/${pr.repo}/pulls/${pr.number}`);
-  if (data.draft) await gh(c.githubKey, `/repos/${pr.repo}/pulls/${pr.number}/ready_for_review`, "POST");
+  if (data.state !== "open") throw new Error(`Pull request is ${data.state}, not open.`);
+  if (data.draft) {
+    const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
+    const ready = await json("https://api.github.com/graphql", "POST", `Bearer ${c.githubKey}`, { query: readyQuery, variables: { id: data.node_id } });
+    if (ready.errors?.length) throw new Error(ready.errors.map((e) => e.message).join("; "));
+    if (ready.data?.markPullRequestReadyForReview?.pullRequest?.isDraft !== false) throw new Error("GitHub did not mark the pull request ready for review.");
+  }
+  if (data.auto_merge) return { readyForReview: true, automergeEnabled: true };
   const q = `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}`;
-  const result = await json("https://api.github.com/graphql", "POST", `Bearer ${c.githubKey}`, { query: q, variables: { id: data.node_id } });
-  if (result.errors?.length) throw new Error(result.errors.map((e) => e.message).join("; "));
+  try {
+    const result = await json("https://api.github.com/graphql", "POST", `Bearer ${c.githubKey}`, { query: q, variables: { id: data.node_id } });
+    if (result.errors?.length) throw new Error(result.errors.map((e) => e.message).join("; "));
+    return { readyForReview: true, automergeEnabled: true };
+  } catch (e) {
+    return { readyForReview: true, automergeEnabled: false, error: `Ready for review, but auto-merge could not be enabled: ${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 async function requestReviewer(c, pr, login) {
   await gh(c.githubKey, `/repos/${pr.repo}/pulls/${pr.number}/requested_reviewers`, "POST", { reviewers: [login] });
@@ -270,6 +385,8 @@ async function closePr(c, pr) {
 // src/main.ts
 var VIEW = "linear-prs";
 var META = ".linear-prs/metadata.json";
+var MERGE_QUEUE_PATH = "M3.75 4.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5ZM3 7.75a.75.75 0 0 1 1.5 0v2.878a2.251 2.251 0 1 1-1.5 0Zm.75 5.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm5-7.75a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Zm5.75 2.5a2.25 2.25 0 1 1-4.5 0 2.25 2.25 0 0 1 4.5 0Zm-1.5 0a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z";
+var stages = ["A", "B", "C"];
 var defaults = { linearKey: "", githubKey: "", favoriteReviewers: "" };
 var empty = () => ({ version: 1, reviewTypes: {}, reviewMessage: [], collapsed: [], selectedRepo: "", hidden: [], lastRefresh: "", pullRequests: [] });
 function message(prs) {
@@ -277,7 +394,17 @@ function message(prs) {
 }
 function icon(parent, name, title, cls = "") {
   const el = parent.createSpan({ cls: `linear-prs-icon ${cls}` });
-  (0, import_obsidian2.setIcon)(el, name);
+  if (name === "linear-prs-merge-queue") {
+    el.addClass("linear-prs-merge-queue");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", MERGE_QUEUE_PATH);
+    path.style.fill = "currentColor";
+    path.style.stroke = "none";
+    svg.appendChild(path);
+    el.appendChild(svg);
+  } else (0, import_obsidian2.setIcon)(el, name);
   if (title) {
     el.setAttr("title", title);
     el.setAttr("aria-label", title);
@@ -285,9 +412,16 @@ function icon(parent, name, title, cls = "") {
   }
   return el;
 }
-function button(parent, label, name, click, active = false) {
-  const b = parent.createEl("button", { cls: `linear-prs-button${active ? " is-active" : ""}`, attr: { "aria-label": label, title: label, type: "button" } });
-  (0, import_obsidian2.setIcon)(b, name);
+function button(parent, label, name, click, active = false, loading) {
+  const b = parent.createEl("button", { cls: `linear-prs-button${active ? " is-active" : ""}${loading ? ` is-loading is-${loading === "spin" ? "spinning" : "pulsing"}` : ""}`, attr: { "aria-label": label, title: label, type: "button" } });
+  if (loading) {
+    b.disabled = true;
+    b.setAttr("aria-busy", "true");
+  }
+  if (stages.includes(name)) {
+    b.setText(name);
+    b.addClass("linear-prs-stage-button");
+  } else (0, import_obsidian2.setIcon)(b, name);
   b.onclick = (e) => {
     e.stopPropagation();
     click();
@@ -304,6 +438,16 @@ function date(iso) {
 function safeError(e) {
   return e instanceof Error ? e.message : String(e);
 }
+async function withDeadline(task, milliseconds, label) {
+  let timer;
+  try {
+    return await Promise.race([task, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out. Try again.`)), milliseconds);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 var LinearPrsPlugin = class extends import_obsidian2.Plugin {
   settings = defaults;
   metadata = empty();
@@ -313,6 +457,7 @@ var LinearPrsPlugin = class extends import_obsidian2.Plugin {
     this.registerView(VIEW, (leaf) => new BoardView(leaf, this));
     this.addRibbonIcon("git-pull-request", "Linear PRs", () => void this.openBoard());
     this.addCommand({ id: "open-linear-prs", name: "Open Linear PRs", callback: () => void this.openBoard() });
+    this.addCommand({ id: "search-pull-requests", name: "Search pull requests", callback: () => this.app.workspace.getActiveViewOfType(BoardView)?.focusSearch() });
     this.addSettingTab(new Preferences(this.app, this));
   }
   async openBoard() {
@@ -325,6 +470,13 @@ var LinearPrsPlugin = class extends import_obsidian2.Plugin {
     if (await adapter.exists(META)) {
       try {
         this.metadata = { ...empty(), ...JSON.parse(await adapter.read(META)) };
+        const types = this.metadata.reviewTypes;
+        for (const id of Object.keys(types)) {
+          if (types[id] === "review") types[id] = "A";
+          else if (types[id] === "stamp") types[id] = "B";
+        }
+        this.metadata.collapsed = this.metadata.collapsed.map((id) => id === "queue:review" ? "queue:A" : id === "queue:stamp" ? "queue:B" : id);
+        await this.saveMetadata();
       } catch (e) {
         new import_obsidian2.Notice(`Linear PRs metadata: ${safeError(e)}`);
       }
@@ -338,11 +490,39 @@ var LinearPrsPlugin = class extends import_obsidian2.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
+  async loadCachedMergeQueueStatus() {
+    if (!this.settings.githubKey) return false;
+    const snapshot = this.metadata.pullRequests;
+    const stale = snapshot.filter((p) => p.mergeQueued === void 0);
+    if (!stale.length) return false;
+    await withDeadline(markMergeQueued(this.settings.githubKey, stale), 3e4, "Merge queue lookup");
+    if (this.metadata.pullRequests !== snapshot) return false;
+    await this.saveMetadata();
+    return true;
+  }
   async refresh() {
     if (!this.settings.linearKey || !this.settings.githubKey) throw new Error("Enter both API keys in Linear PRs settings.");
-    const result = await discover(this.settings);
+    const result = await withDeadline(discover(this.settings), 9e4, "Board refresh");
     this.metadata.pullRequests = [...result.prs, ...this.metadata.pullRequests.filter((p) => this.metadata.hidden.includes(p.id) && !result.prs.some((n) => n.id === p.id))];
     this.metadata.lastRefresh = (/* @__PURE__ */ new Date()).toISOString();
+    await this.saveMetadata();
+    return result;
+  }
+  async refreshGroup(groupId, groupUrl) {
+    if (!this.settings.linearKey || !this.settings.githubKey) throw new Error("Enter both API keys in Linear PRs settings.");
+    const previous = this.metadata.pullRequests.filter((p) => p.groupId === groupId);
+    const result = await withDeadline(discoverGroup(this.settings, groupId, groupUrl, [...new Set(previous.map((p) => p.repo))], [...new Set(previous.map((p) => p.issueId).filter(Boolean))]), 3e4, "Group refresh");
+    if (result.errors.length) throw new Error(`Group refresh failed: ${result.errors[0]}${result.errors.length > 1 ? ` (${result.errors.length} errors total)` : ""}`);
+    const updated = new Set(result.prs.map((p) => p.id));
+    this.metadata.pullRequests = [...result.prs, ...this.metadata.pullRequests.filter((p) => !updated.has(p.id) && (p.groupId !== groupId || this.metadata.hidden.includes(p.id)))];
+    await this.saveMetadata();
+    return result;
+  }
+  async refreshSelectedPrs(prs) {
+    if (!this.settings.githubKey) throw new Error("Enter a GitHub API key in Linear PRs settings.");
+    const result = await withDeadline(refreshPrs(this.credentials(), prs), 3e4, "Pull request refresh");
+    const selected = new Set(prs.map((p) => p.id));
+    this.metadata.pullRequests = [...result, ...this.metadata.pullRequests.filter((p) => !selected.has(p.id))];
     await this.saveMetadata();
     return result;
   }
@@ -387,6 +567,10 @@ var BoardView = class extends import_obsidian2.ItemView {
   }
   busy = false;
   archived = false;
+  search = "";
+  searchInput = null;
+  launching = /* @__PURE__ */ new Set();
+  refreshingGroups = /* @__PURE__ */ new Set();
   getViewType() {
     return VIEW;
   }
@@ -397,8 +581,20 @@ var BoardView = class extends import_obsidian2.ItemView {
     return "git-pull-request";
   }
   async onOpen() {
+    this.scope = new import_obsidian2.Scope(this.app.scope);
+    this.scope.register([import_obsidian2.Platform.isMacOS ? "Meta" : "Ctrl"], "f", (event) => {
+      event.preventDefault();
+      this.focusSearch();
+    });
     this.render();
-    if (this.plugin.settings.linearKey && this.plugin.settings.githubKey) void this.refresh();
+    if (!this.plugin.metadata.lastRefresh && this.plugin.settings.linearKey && this.plugin.settings.githubKey) void this.refresh();
+    else void this.plugin.loadCachedMergeQueueStatus().then((changed) => {
+      if (changed) this.render();
+    }).catch((e) => new import_obsidian2.Notice(safeError(e), 8e3));
+  }
+  focusSearch() {
+    this.searchInput?.focus();
+    this.searchInput?.select();
   }
   async act(fn, success) {
     try {
@@ -410,7 +606,7 @@ var BoardView = class extends import_obsidian2.ItemView {
     }
   }
   async refresh() {
-    if (this.busy) return;
+    if (this.busy || this.refreshingGroups.size) return;
     this.busy = true;
     this.render();
     try {
@@ -424,22 +620,68 @@ var BoardView = class extends import_obsidian2.ItemView {
       this.render();
     }
   }
+  async refreshGroup(id, url, title) {
+    if (this.busy || this.refreshingGroups.size) return;
+    this.refreshingGroups.add(id);
+    this.render();
+    try {
+      const r = await this.plugin.refreshGroup(id, url);
+      new import_obsidian2.Notice(`${title}: refreshed ${r.prs.length} PRs`);
+    } catch (e) {
+      new import_obsidian2.Notice(safeError(e), 8e3);
+    } finally {
+      this.refreshingGroups.delete(id);
+      this.render();
+    }
+  }
+  async refreshQueue(type, title) {
+    if (this.busy || this.refreshingGroups.size) return;
+    const key = `queue:${type}`;
+    const m = this.plugin.metadata;
+    const prs = m.pullRequests.filter((p) => !m.hidden.includes(p.id) && m.reviewTypes[p.id] === type);
+    this.refreshingGroups.add(key);
+    this.render();
+    try {
+      const result = await this.plugin.refreshSelectedPrs(prs);
+      new import_obsidian2.Notice(`${title}: refreshed ${result.length} PRs`);
+    } catch (e) {
+      new import_obsidian2.Notice(safeError(e), 8e3);
+    } finally {
+      this.refreshingGroups.delete(key);
+      this.render();
+    }
+  }
+  rememberCollapse(details2, id) {
+    const m = this.plugin.metadata;
+    details2.open = !m.collapsed.includes(id);
+    let lastOpen = details2.open;
+    details2.ontoggle = () => {
+      if (!details2.isConnected || details2.open === lastOpen) return;
+      lastOpen = details2.open;
+      m.collapsed = details2.open ? m.collapsed.filter((x) => x !== id) : [.../* @__PURE__ */ new Set([...m.collapsed, id])];
+      void this.plugin.saveMetadata();
+    };
+  }
   visible() {
     const m = this.plugin.metadata;
-    return m.pullRequests.filter((p) => this.archived ? m.hidden.includes(p.id) : !m.hidden.includes(p.id)).filter((p) => !m.selectedRepo || p.repo === m.selectedRepo).sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    const query = this.search.trim().toLocaleLowerCase();
+    return m.pullRequests.filter((p) => this.archived ? m.hidden.includes(p.id) : !m.hidden.includes(p.id)).filter((p) => !m.selectedRepo || p.repo === m.selectedRepo).filter((p) => !query || [p.title, p.repo, String(p.number), p.id, p.issueTitle, p.issueUrl, p.groupTitle].some((value) => value?.toLocaleLowerCase().includes(query))).sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   }
-  queue(prs, title, parent) {
+  queue(prs, title, type, parent) {
     const details2 = parent.createEl("details", { cls: "linear-prs-group" });
-    details2.open = true;
+    this.rememberCollapse(details2, `queue:${type}`);
     const summary = details2.createEl("summary", { cls: "linear-prs-group-header" });
     icon(summary, "chevron-down", void 0, "linear-prs-chevron");
     summary.createSpan({ text: title, cls: "linear-prs-group-title" });
     const tools = summary.createSpan({ cls: "linear-prs-actions" });
     tools.createSpan({ text: String(prs.length), cls: "linear-prs-count" });
+    const key = `queue:${type}`;
+    const refresh = button(tools, `Refresh ${title}`, "refresh-cw", () => void this.refreshQueue(type, title), false, this.refreshingGroups.has(key) ? "spin" : void 0);
+    if (this.busy || this.refreshingGroups.size && !this.refreshingGroups.has(key)) refresh.disabled = true;
     button(tools, `Copy ${title}`, "copy", () => void this.copy(message(prs)));
-    button(tools, `Launch ${title}`, "rocket", () => void this.launchMany(prs));
+    button(tools, `Launch ${title}`, "rocket", () => void this.launchMany(prs), false, this.isLaunching(prs) ? "pulse" : void 0);
     const list = details2.createDiv({ cls: "linear-prs-list" });
-    if (!prs.length) list.createDiv({ text: title === "PRs in Review" ? "No pull requests in review" : "No pull requests to stamp", cls: "linear-prs-empty" });
+    if (!prs.length) list.createDiv({ text: `No pull requests in ${title}`, cls: "linear-prs-empty" });
     else prs.forEach((p) => this.row(p, list));
   }
   async copy(text) {
@@ -455,23 +697,45 @@ var BoardView = class extends import_obsidian2.ItemView {
     await this.plugin.saveMetadata();
     this.render();
   }
+  launchKey(prs) {
+    return prs.map((p) => p.id).sort().join("");
+  }
+  isLaunching(prs) {
+    return this.launching.has(this.launchKey(prs));
+  }
   async launchMany(prs) {
     if (!prs.length) return;
-    let done = 0;
-    const errors = [];
-    for (const p of prs) {
-      try {
-        await launchPr(this.plugin.credentials(), p);
-        p.draft = false;
-        p.automerge = true;
-        done++;
-      } catch (e) {
-        errors.push(`${p.repo}#${p.number}: ${safeError(e)}`);
-      }
-    }
-    await this.plugin.saveMetadata();
+    const key = this.launchKey(prs);
+    if (this.launching.has(key)) return;
+    this.launching.add(key);
     this.render();
-    new import_obsidian2.Notice(`Launched ${done}/${prs.length} PRs${errors.length ? `. ${errors.join("; ")}` : ""}`, errors.length ? 1e4 : 4e3);
+    let launched = 0;
+    let readyOnly = 0;
+    const errors = [];
+    try {
+      for (const p of prs) {
+        try {
+          const result = await launchPr(this.plugin.credentials(), p);
+          p.draft = !result.readyForReview;
+          p.automerge = result.automergeEnabled;
+          if (result.automergeEnabled) launched++;
+          else {
+            readyOnly++;
+            errors.push(`${p.repo}#${p.number}: ${result.error ?? "Ready for review, but auto-merge is disabled."}`);
+          }
+        } catch (e) {
+          errors.push(`${p.repo}#${p.number}: ${safeError(e)}`);
+        }
+      }
+      await this.plugin.saveMetadata();
+      const summary = `Launched ${launched}/${prs.length} PRs${readyOnly ? `; ${readyOnly} ready without auto-merge` : ""}${errors.length ? `. ${errors.join("; ")}` : ""}`;
+      new import_obsidian2.Notice(summary, errors.length ? 1e4 : 4e3);
+    } catch (e) {
+      new import_obsidian2.Notice(safeError(e), 8e3);
+    } finally {
+      this.launching.delete(key);
+      this.render();
+    }
   }
   reviewBlock(parent) {
     const m = this.plugin.metadata;
@@ -480,17 +744,12 @@ var BoardView = class extends import_obsidian2.ItemView {
     const block = parent.createDiv({ cls: "linear-prs-review-block" });
     block.createEl("pre", { text: message(items) });
     const actions = block.createDiv({ cls: "linear-prs-actions" });
-    button(actions, "Mark all as please stamp", "stamp", () => void this.act(async () => {
-      await this.track("stamp", items);
+    for (const stage of stages) button(actions, `Move all to Staging ${stage}`, stage, () => void this.act(async () => {
+      await this.track(stage, items);
       m.reviewMessage = [];
       await this.plugin.saveMetadata();
-    }, "Moved to stamp"));
-    button(actions, "Mark all as please review", "eye", () => void this.act(async () => {
-      await this.track("review", items);
-      m.reviewMessage = [];
-      await this.plugin.saveMetadata();
-    }, "Moved to review"));
-    button(actions, "Launch review PRs", "rocket", () => void this.launchMany(items));
+    }, `Moved to Staging ${stage}`));
+    button(actions, "Launch review PRs", "rocket", () => void this.launchMany(items), false, this.isLaunching(items) ? "pulse" : void 0);
     button(actions, "Copy review message", "copy", () => void this.copy(message(items)));
     button(actions, "Clear review message", "trash-2", () => void this.act(async () => {
       m.reviewMessage = [];
@@ -503,7 +762,7 @@ var BoardView = class extends import_obsidian2.ItemView {
     const top = row.createDiv({ cls: "linear-prs-row-top" });
     const link = top.createEl("a", { href: p.url, cls: "linear-prs-title" });
     link.setAttr("target", "_blank");
-    icon(link, p.draft ? "git-pull-request-draft" : "git-pull-request", p.draft ? "draft" : "open", p.draft ? "dim" : "good");
+    icon(link, p.mergeQueued ? "linear-prs-merge-queue" : p.draft ? "git-pull-request-draft" : "git-pull-request", p.mergeQueued ? "In merge queue" : p.draft ? "draft" : "open", p.mergeQueued ? "orange" : p.draft ? "dim" : "good");
     link.createSpan({ text: p.title, cls: "linear-prs-title-text" });
     const controls = top.createSpan({ cls: "linear-prs-actions linear-prs-controls" });
     const remove = controls.createSpan({ cls: "linear-prs-control-set" });
@@ -518,15 +777,24 @@ var BoardView = class extends import_obsidian2.ItemView {
       await this.plugin.saveMetadata();
       await navigator.clipboard.writeText(message(m.reviewMessage.map((id) => m.pullRequests.find((x) => x.id === id)).filter((x) => !!x)));
     }, "Added to review message"));
-    button(review, "Please stamp", "stamp", () => void this.act(() => this.track(m.reviewTypes[p.id] === "stamp" ? "none" : "stamp", [p]), "Updated review type"), m.reviewTypes[p.id] === "stamp");
-    button(review, "Please review", "eye", () => void this.act(() => this.track(m.reviewTypes[p.id] === "review" ? "none" : "review", [p]), "Updated review type"), m.reviewTypes[p.id] === "review");
+    for (const stage of stages) button(review, `Staging ${stage}`, stage, () => void this.act(() => this.track(m.reviewTypes[p.id] === stage ? "none" : stage, [p]), "Updated staging"), m.reviewTypes[p.id] === stage);
     const badges = controls.createSpan({ cls: "linear-prs-control-set linear-prs-badges" });
     icon(badges, "message-square", p.comments ? "Pull request has comments" : "Pull request has no comments", p.comments ? "orange" : "dim");
-    icon(badges, "user", p.reviewers.length ? p.reviewers.map((r) => `${r.login}: ${r.status}`).join(", ") : "No reviewers assigned", p.reviewers.length && p.reviewers.every((r) => r.status === "approved") ? "good" : "dim");
+    const reviewerTone = p.reviewers.some((r) => r.status === "approved") ? "good" : p.reviewers.some((r) => r.status === "dismissed") ? "orange" : "dim";
+    icon(badges, "user", p.reviewers.length ? p.reviewers.map((r) => `${r.login}: ${r.status}`).join(", ") : "No reviewers assigned", reviewerTone);
     icon(badges, "git-merge", p.automerge ? "Automerge enabled" : "Automerge disabled", p.automerge ? "good" : "dim");
-    const checkTitle = [p.conflicts ? "Merge conflicts" : "", ...p.checks.map((c) => `${c.name}: ${c.status}`)].filter(Boolean).join(", ") || "No checks";
-    const checkStatus = p.conflicts || p.checks.some((c) => c.status === "failure") ? "bad" : p.checks.some((c) => c.status === "pending") ? "dim" : "good";
-    icon(badges, checkStatus === "bad" ? "circle-x" : checkStatus === "dim" ? "loader-circle" : "circle-check", checkTitle, checkStatus);
+    const failed = p.checks.filter((c) => c.status === "failure");
+    const pending = p.checks.filter((c) => c.status === "pending");
+    const checkStatus = p.conflicts || failed.length ? "bad" : pending.length ? "dim" : "good";
+    const reasons = [...p.conflicts ? ["Merge conflicts with the base branch"] : [], ...failed.slice(0, 8).map((c) => `${c.name}${c.detail ? `: ${c.detail}` : ""}`)];
+    if (failed.length > 8) reasons.push(`And ${failed.length - 8} more failing checks`);
+    const checkTitle = checkStatus === "bad" ? `Why this PR is failing:
+${reasons.join("\n")}` : checkStatus === "dim" ? `Checks pending:
+${pending.map((c) => c.name).join("\n")}` : p.checks.length ? "All checks passing" : "No checks reported";
+    const checkBadge = icon(badges, checkStatus === "bad" ? "circle-x" : checkStatus === "dim" ? "loader-circle" : "circle-check", void 0, checkStatus);
+    checkBadge.setAttr("role", "img");
+    checkBadge.setAttr("aria-label", checkTitle);
+    (0, import_obsidian2.setTooltip)(checkBadge, checkTitle, { placement: "top", classes: ["linear-prs-check-tooltip"] });
     const meta = row.createDiv({ cls: "linear-prs-meta" });
     const refs = meta.createSpan({ cls: "linear-prs-meta-link" });
     if (p.issueTitle && p.issueUrl) {
@@ -541,9 +809,8 @@ var BoardView = class extends import_obsidian2.ItemView {
     meta.createSpan({ text: date(p.createdAt), cls: "linear-prs-date" });
   }
   group(prs, id, title, url, parent) {
-    const m = this.plugin.metadata;
     const details2 = parent.createEl("details", { cls: "linear-prs-group" });
-    details2.open = !m.collapsed.includes(id);
+    this.rememberCollapse(details2, id);
     const summary = details2.createEl("summary", { cls: "linear-prs-group-header" });
     icon(summary, "chevron-down", void 0, "linear-prs-chevron");
     if (url) {
@@ -553,7 +820,10 @@ var BoardView = class extends import_obsidian2.ItemView {
     } else summary.createSpan({ text: title, cls: "linear-prs-group-title" });
     const actions = summary.createSpan({ cls: "linear-prs-actions" });
     actions.createSpan({ text: String(prs.length), cls: "linear-prs-count" });
-    button(actions, "Launch group PRs", "rocket", () => void this.launchMany(prs));
+    const refresh = button(actions, `Refresh ${title}`, "refresh-cw", () => void this.refreshGroup(id, url, title), false, this.refreshingGroups.has(id) ? "spin" : void 0);
+    if (this.busy || this.refreshingGroups.size && !this.refreshingGroups.has(id)) refresh.disabled = true;
+    button(actions, "Copy group PRs", "copy", () => void this.copy(message(prs)));
+    button(actions, "Launch group PRs", "rocket", () => void this.launchMany(prs), false, this.isLaunching(prs) ? "pulse" : void 0);
     const reviewers = this.plugin.settings.favoriteReviewers.split(",").map((s) => s.trim()).filter(Boolean);
     if (reviewers.length) {
       const select = actions.createEl("select", { cls: "linear-prs-reviewer-select", attr: { "aria-label": "Assign reviewer to group PRs" } });
@@ -569,10 +839,6 @@ var BoardView = class extends import_obsidian2.ItemView {
         select.value = "";
       };
     }
-    details2.ontoggle = () => {
-      m.collapsed = details2.open ? m.collapsed.filter((x) => x !== id) : [.../* @__PURE__ */ new Set([...m.collapsed, id])];
-      void this.plugin.saveMetadata();
-    };
     const list = details2.createDiv({ cls: "linear-prs-list" });
     prs.forEach((p) => this.row(p, list));
   }
@@ -598,17 +864,36 @@ var BoardView = class extends import_obsidian2.ItemView {
         this.render();
       };
     }
+    const shortcutLabel = import_obsidian2.Platform.isMacOS ? "\u2318F" : "Ctrl+F";
+    const search = right.createEl("input", { cls: "linear-prs-search", attr: { type: "search", placeholder: "Search pull requests\u2026", "aria-label": "Search pull requests", title: `Search pull requests (${shortcutLabel})` } });
+    search.value = this.search;
+    this.searchInput = search;
+    search.oninput = () => {
+      this.search = search.value;
+      const start = search.selectionStart;
+      this.render();
+      this.searchInput?.focus();
+      this.searchInput?.setSelectionRange(start, start);
+    };
+    search.onkeydown = (event) => {
+      if (event.key === "Escape" && search.value) {
+        event.stopPropagation();
+        this.search = "";
+        this.render();
+        this.searchInput?.focus();
+      }
+    };
     button(right, "Archived pull requests", "archive", () => {
       this.archived = !this.archived;
       this.render();
     }, this.archived);
-    button(right, "Refresh from Linear and GitHub", "refresh-cw", () => void this.refresh());
+    const refresh = button(right, "Refresh from Linear and GitHub", "refresh-cw", () => void this.refresh(), false, this.busy ? "spin" : void 0);
+    if (this.refreshingGroups.size) refresh.disabled = true;
     if (!this.plugin.settings.linearKey || !this.plugin.settings.githubKey) shell.createDiv({ text: "Add a Linear API key and GitHub API key in Linear PRs settings, then refresh.", cls: "linear-prs-empty" });
     this.reviewBlock(shell);
     const all = this.visible();
     if (!this.archived) {
-      this.queue(all.filter((p) => m.reviewTypes[p.id] === "review"), "PRs in Review", shell);
-      this.queue(all.filter((p) => m.reviewTypes[p.id] === "stamp"), "PRs To Be Stamped", shell);
+      for (const stage of stages) this.queue(all.filter((p) => m.reviewTypes[p.id] === stage), `Staging ${stage}`, stage, shell);
     }
     shell.createEl("h2", { text: this.archived ? "Archived pull requests" : "Pull requests", cls: "linear-prs-section-title" });
     const normal = this.archived ? all : all.filter((p) => (m.reviewTypes[p.id] ?? "none") === "none");
@@ -624,8 +909,13 @@ var BoardView = class extends import_obsidian2.ItemView {
     }
     if (!groups.size) shell.createDiv({ text: "No pull requests associated with Linear tasks", cls: "linear-prs-empty" });
     const unlinked = normal.filter((p) => p.groupId === "unlinked");
-    shell.createEl("h2", { text: `Pull requests without Linear tasks (${unlinked.length})`, cls: "linear-prs-section-title linear-prs-unlinked-title" });
-    const list = shell.createDiv({ cls: "linear-prs-unlinked-list" });
+    const unlinkedDetails = shell.createEl("details", { cls: "linear-prs-group linear-prs-unlinked-group" });
+    this.rememberCollapse(unlinkedDetails, "section:unlinked");
+    const unlinkedSummary = unlinkedDetails.createEl("summary", { cls: "linear-prs-group-header" });
+    icon(unlinkedSummary, "chevron-down", void 0, "linear-prs-chevron");
+    unlinkedSummary.createSpan({ text: "Pull requests without Linear tasks", cls: "linear-prs-group-title" });
+    unlinkedSummary.createSpan({ text: String(unlinked.length), cls: "linear-prs-count" });
+    const list = unlinkedDetails.createDiv({ cls: "linear-prs-unlinked-list" });
     if (unlinked.length) unlinked.forEach((p) => this.row(p, list));
     else list.createDiv({ text: "No pull requests without Linear tasks", cls: "linear-prs-empty" });
   }

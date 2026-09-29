@@ -1,6 +1,6 @@
 # Linear PRs for Obsidian
 
-An Obsidian view modeled on the `plz` `/code` page. It finds open Linear issues assigned to the Linear API key owner, follows child issues, and groups open GitHub PRs by each issue's immediate parent. A bottom section lists open PRs authored by the GitHub API key owner that have no Linear task association. It shows review and stamp queues, a copyable review message, GitHub checks, reviewers, comments, and automerge state. Board tracking persists in `.linear-prs/metadata.json` in the vault.
+An Obsidian board for Linear issues and GitHub pull requests. It finds open Linear issues assigned to the Linear API key owner, follows child issues, and groups open GitHub PRs by each issue's immediate parent. A bottom section lists open PRs authored by the GitHub API key owner that have no Linear task association. It shows Staging A, B, and C queues, a copyable review message, GitHub checks, reviewers, comments, and automerge state. Board tracking persists in `.linear-prs/metadata.json` in the vault.
 
 ## Install
 
@@ -12,6 +12,16 @@ The keys are stored in Obsidian plugin settings at `.obsidian/plugins/obsidian-l
 
 ## Discovery and actions
 
-The plugin reads GitHub PR URLs attached to Linear issues. It also searches GitHub for issue identifiers within repositories linked by those attachments, then checks each candidate's title, body, or branch for an exact identifier. It recursively follows child issues under open issues assigned to the authenticated Linear user. Each associated PR appears under its issue's immediate parent; PRs on issues without a parent use their Linear project. The plugin also searches for open PRs authored by the authenticated GitHub user across accessible repositories and puts PRs with no Linear attachment or issue reference in an ungrouped section at the bottom. Only open PRs appear on the active board.
+The plugin reads GitHub PR URLs attached to Linear issues. It lists open PRs once per repository linked by those attachments, then matches issue identifiers in each PR's title, body, or branch. It recursively follows child issues under open issues assigned to the authenticated Linear user. Each associated PR appears under its issue's immediate parent; PRs on issues without a parent use their Linear project. The plugin also searches for open PRs authored by the authenticated GitHub user across accessible repositories and puts PRs with no Linear attachment or issue reference in an ungrouped section at the bottom. Only open PRs appear on the active board.
 
-Actions mirror the `/code` page: copy PRs, mark stamp or review, build a review message, launch PRs by marking drafts ready and enabling automerge, request a reviewer for a group, and close/remove a PR. The archived view shows PRs closed from this plugin. Refresh fetches current Linear and GitHub data while retaining local review state.
+Board actions: copy PRs, move PRs between Staging A, B, and C, build a review message, launch PRs by requesting a rebase onto the base branch when needed, marking drafts ready, and enabling automerge, request a reviewer for a group, and close/remove a PR. The archived view shows PRs closed from this plugin. The toolbar refresh updates the whole board; each group header also has a refresh button that reloads only that group's Linear issues and linked PRs. Refresh retains local staging state.
+
+## Development
+
+Run `npm ci`, `npm run check`, and `npm run build`. Use `npm run format` to apply formatting and `npm run dev` while developing. Generated `main.js` and `styles.css` are committed for direct installation.
+
+Read the [code style](docs/CODE_STYLE.md), [architecture](docs/ARCHITECTURE.md), and [PR guidelines](docs/PR_STYLE.md) before contributing. Regression tests use mocked HTTP responses and do not access live accounts.
+
+Launch uses GitHub’s branch update API with the rebase method. It compares against the current base branch and verifies that the PR’s head changes and is no longer behind before reporting a completed rebase. Branches already up to date are skipped. Conflicts, permissions, or uncompleted rebases appear in a persistent launch notice while the remaining launch actions continue. A failed rebase is excluded from the successful launch count.
+
+Each PR row groups controls as trash, refresh, and copy; staging A/B/C; then status badges. The row refresh fetches only that PR’s latest GitHub state, attempts a rebase when needed, and reloads its checks and status afterward. It preserves draft state, auto-merge settings, and local staging assignments.

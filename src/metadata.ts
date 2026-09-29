@@ -1,9 +1,9 @@
 import type { PullRequest } from './types';
 export const BOARD_VIEW_TYPE = 'linear-prs';
 export const METADATA_PATH = '.linear-prs/metadata.json';
-export type Stage = 'A' | 'B' | 'C';
+export type Stage = 'A' | 'B' | 'C' | 'D';
 export type StagingAssignment = 'none' | Stage;
-export const STAGES: Stage[] = ['A', 'B', 'C'];
+export const STAGES: Stage[] = ['A', 'B', 'C', 'D'];
 export type Metadata = {
   version: 1;
   reviewTypes: Record<string, StagingAssignment>;

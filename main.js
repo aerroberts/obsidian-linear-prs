@@ -986,7 +986,7 @@ async function refreshPrs(credentials, previous) {
 // src/metadata.ts
 var BOARD_VIEW_TYPE = "linear-prs";
 var METADATA_PATH = ".linear-prs/metadata.json";
-var STAGES = ["A", "B", "C"];
+var STAGES = ["A", "B", "C", "D"];
 var DEFAULT_SETTINGS = {
   linearKey: "",
   githubKey: "",

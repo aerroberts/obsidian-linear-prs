@@ -76,13 +76,18 @@ function mockPullRequestDetails() {
 test('migrates legacy queues without losing board state or mutating input', () => {
   const saved = {
     ...createEmptyMetadata(),
-    reviewTypes: { one: 'review' as const, two: 'stamp' as const, three: 'C' as const },
+    reviewTypes: {
+      one: 'review' as const,
+      two: 'stamp' as const,
+      three: 'C' as const,
+      four: 'D' as const,
+    },
     collapsed: ['queue:review', 'queue:stamp', 'group'],
     hidden: ['closed'],
     reviewMessage: ['one'],
   };
   const migrated = migrateMetadata(saved);
-  assert.deepEqual(migrated.reviewTypes, { one: 'A', two: 'B', three: 'C' });
+  assert.deepEqual(migrated.reviewTypes, { one: 'A', two: 'B', three: 'C', four: 'D' });
   assert.deepEqual(migrated.collapsed, ['queue:A', 'queue:B', 'group']);
   assert.deepEqual(migrated.hidden, ['closed']);
   assert.deepEqual(migrated.reviewMessage, ['one']);

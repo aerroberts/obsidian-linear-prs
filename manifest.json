@@ -1,1 +1,9 @@
-{"id":"obsidian-linear-prs","name":"Linear PRs","version":"0.1.1","minAppVersion":"1.4.0","description":"A pull request board for open Linear issues assigned to you.","author":"Eric","isDesktopOnly":false}
+{
+  "id": "obsidian-linear-prs",
+  "name": "Linear PRs",
+  "version": "0.1.1",
+  "minAppVersion": "1.4.0",
+  "description": "A pull request board for open Linear issues assigned to you.",
+  "author": "Eric",
+  "isDesktopOnly": false
+}

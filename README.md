@@ -15,3 +15,9 @@ The keys are stored in Obsidian plugin settings at `.obsidian/plugins/obsidian-l
 The plugin reads GitHub PR URLs attached to Linear issues. It lists open PRs once per repository linked by those attachments, then matches issue identifiers in each PR's title, body, or branch. It recursively follows child issues under open issues assigned to the authenticated Linear user. Each associated PR appears under its issue's immediate parent; PRs on issues without a parent use their Linear project. The plugin also searches for open PRs authored by the authenticated GitHub user across accessible repositories and puts PRs with no Linear attachment or issue reference in an ungrouped section at the bottom. Only open PRs appear on the active board.
 
 Board actions: copy PRs, move PRs between Staging A, B, and C, build a review message, launch PRs by marking drafts ready and enabling automerge, request a reviewer for a group, and close/remove a PR. The archived view shows PRs closed from this plugin. The toolbar refresh updates the whole board; each group header also has a refresh button that reloads only that group's Linear issues and linked PRs. Refresh retains local staging state.
+
+## Development
+
+Run `npm ci`, `npm run check`, and `npm run build`. Use `npm run format` to apply formatting and `npm run dev` while developing. Generated `main.js` and `styles.css` are committed for direct installation.
+
+Read the [code style](docs/CODE_STYLE.md), [architecture](docs/ARCHITECTURE.md), and [PR guidelines](docs/PR_STYLE.md) before contributing. Regression tests use mocked HTTP responses and do not access live accounts.

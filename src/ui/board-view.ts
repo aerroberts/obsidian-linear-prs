@@ -43,27 +43,6 @@ export class BoardView extends ItemView {
       this.focusSearch();
     });
     this.render();
-    this.registerInterval(
-      window.setInterval(() => {
-        if (this.app.workspace.getActiveViewOfType(BoardView) === this) {
-          void this.refresh({ quiet: true });
-        }
-      }, 60000),
-    );
-    this.registerEvent(
-      this.app.workspace.on('active-leaf-change', () => {
-        if (
-          this.app.workspace.getActiveViewOfType(BoardView) === this &&
-          Date.now() - Date.parse(this.plugin.metadata.lastRefresh || '1970-01-01') >=
-            60000
-        ) {
-          void this.refresh({ quiet: true });
-        }
-      }),
-    );
-    if (this.plugin.settings.linearKey && this.plugin.settings.githubKey) {
-      void this.refresh({ quiet: true });
-    }
   }
 
   focusSearch() {
@@ -79,7 +58,7 @@ export class BoardView extends ItemView {
       new Notice(errorMessage(e), 8000);
     }
   }
-  private async refresh(options: { quiet?: boolean } = {}) {
+  private async refresh() {
     if (
       this.busy ||
       this.refreshingGroups.size ||
@@ -93,11 +72,9 @@ export class BoardView extends ItemView {
     this.render();
     try {
       const r = await this.plugin.refresh();
-      if (!options.quiet) {
-        new Notice(
-          `Linear PRs: ${r.prs.length} open PRs${r.errors.length ? `, ${r.errors.length} lookup errors` : ''}`,
-        );
-      }
+      new Notice(
+        `Linear PRs: ${r.prs.length} open PRs${r.errors.length ? `, ${r.errors.length} lookup errors` : ''}`,
+      );
       if (r.errors.length) {
         console.warn('Linear PR lookup errors', r.errors);
       }

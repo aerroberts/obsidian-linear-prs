@@ -1,3 +1,4 @@
+import { fetchSnapshots } from '../api/snapshots';
 import { forEachConcurrent } from '../async';
 import { renderPullRequestBadges } from './pull-request-badges';
 import type { WorkspaceLeaf } from 'obsidian';
@@ -93,14 +94,14 @@ export class BoardView extends ItemView {
       this.render();
     }
   }
-  private async refreshGroup(id: string, url: string, title: string) {
+  private async refreshGroup(id: string, title: string) {
     if (this.busy || this.refreshingGroups.size) {
       return;
     }
     this.refreshingGroups.add(id);
     this.render();
     try {
-      const r = await this.plugin.refreshGroup(id, url);
+      const r = await this.plugin.refreshGroup(id);
       new Notice(`${title}: refreshed ${r.prs.length} PRs`);
     } catch (e) {
       new Notice(errorMessage(e), 8000);
@@ -262,9 +263,26 @@ export class BoardView extends ItemView {
     let rebasesCompleted = 0;
     const errors: string[] = [];
     try {
+      const snapshots = await fetchSnapshots(
+        this.plugin.credentials().githubKey,
+        pullRequests,
+      );
+      const current = new Map(
+        snapshots
+          .filter((snapshot) => snapshot.pullRequest)
+          .map((snapshot) => [snapshot.pullRequest!.id, snapshot]),
+      );
       await forEachConcurrent(pullRequests, 3, async (pullRequest) => {
         try {
-          const result = await launchPr(this.plugin.credentials(), pullRequest);
+          const snapshot = current.get(pullRequest.id);
+          if (!snapshot?.pullRequest) {
+            throw new Error('Pull request is no longer open.');
+          }
+          const result = await launchPr(
+            this.plugin.credentials(),
+            pullRequest,
+            snapshot.remote,
+          );
           if (result.rebaseStatus === 'updated') {
             rebasesCompleted++;
           }
@@ -515,7 +533,7 @@ export class BoardView extends ItemView {
       actions,
       `Refresh ${title}`,
       'refresh-cw',
-      () => void this.refreshGroup(id, url, title),
+      () => void this.refreshGroup(id, title),
       { loading: this.refreshingGroups.has(id) ? 'spin' : undefined },
     );
     if (this.busy || (this.refreshingGroups.size && !this.refreshingGroups.has(id))) {

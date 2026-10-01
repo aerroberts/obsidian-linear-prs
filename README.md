@@ -1,6 +1,6 @@
 # Linear PRs for Obsidian
 
-An Obsidian board for Linear issues and GitHub pull requests. It finds open Linear issues assigned to the Linear API key owner, follows child issues, and groups open GitHub PRs by each issue's immediate parent. A bottom section lists open PRs authored by the GitHub API key owner that have no Linear task association. It shows Staging A, B, C, and D queues, a copyable review message, GitHub checks, reviewers, comments, and automerge state. Board tracking persists in `.linear-prs/metadata.json` in the vault.
+An Obsidian board for Linear issues and GitHub pull requests. It reads all open pull requests authored by the GitHub API key owner, including drafts and merge-queue entries, then resolves their Linear context in batches. Associated PRs group under the issue's immediate parent, or its project when it has no parent. A bottom section lists open PRs authored by the GitHub API key owner that have no Linear task association. It shows Staging A, B, C, and D queues, a copyable review message, GitHub checks, reviewers, comments, and automerge state. Board tracking persists in `.linear-prs/metadata.json` in the vault.
 
 ## Install
 
@@ -12,9 +12,11 @@ The keys are stored in Obsidian plugin settings at `.obsidian/plugins/obsidian-l
 
 ## Discovery and actions
 
-The plugin reads GitHub PR URLs attached to Linear issues. It lists open PRs once per repository linked by those attachments, then matches issue identifiers in each PR's title, body, or branch. It recursively follows child issues under open issues assigned to the authenticated Linear user. Each associated PR appears under its issue's immediate parent; PRs on issues without a parent use their Linear project. The plugin also searches for open PRs authored by the authenticated GitHub user across accessible repositories and puts PRs with no Linear attachment or issue reference in an ungrouped section at the bottom. Only open PRs appear on the active board.
+A full refresh uses one GitHub GraphQL search operation to read your open PRs and their status, then batches Linear `attachmentsForURL` lookups with the full issue and parent/project context. Attachments take precedence over identifiers in PR titles, bodies, and branches; identifiers provide a fallback when there is no attachment. Issues outside your assigned tree and archived issues can still provide context. Multiple attached issues are retained, with a deterministic primary issue for grouping. PRs with no match stay visible in the unlinked section.
 
-Board actions: copy PRs, move PRs between Staging A, B, C, and D, build a review message, launch PRs by requesting a rebase onto the base branch when needed, marking drafts ready, and enabling automerge, request a reviewer for a group, and close/remove a PR. The archived view shows PRs closed from this plugin. The toolbar refresh updates the whole board; each group header also has a refresh button that reloads only that group's Linear issues and linked PRs. Refresh retains local staging state.
+Existing group refresh reads the group's cached PR identities in one GitHub GraphQL query and retains their Linear context. Full refresh discovers new PRs and recomputes associations. Shipping also reads its group in one query, reuses those snapshots for actions, and reads the resulting status in one query afterward. Rebase comparisons, guarded writes, and asynchronous verification are separate API operations. GraphQL connections use cursor pagination only when needed; account search and scoped reads use pages of up to 100 PRs. Failed or truncated reads retain the cached board instead of silently marking PRs unlinked. Check summaries are included; individual check annotations are omitted from bulk reads to stay within GitHub's resource limits.
+
+Board actions: copy PRs, move PRs between Staging A, B, C, and D, build a review message, launch PRs by requesting a rebase onto the base branch when needed, marking drafts ready, and enabling automerge, request a reviewer for a group, and close/remove a PR. The archived view shows PRs closed from this plugin. The toolbar refresh updates the whole board; each group header also has a refresh button that reloads only that group's existing PRs. Refresh retains local staging state.
 
 ## Development
 

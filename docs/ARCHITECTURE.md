@@ -8,11 +8,12 @@ The API modules have separate responsibilities:
 
 - `transport.ts`: Obsidian HTTP requests and Linear GraphQL errors.
 - `responses.ts`: consumed GitHub response fields.
-- `linear.ts`: issue and attachment queries with pagination.
-- `github.ts`: pull request details, checks, reviewers, merge queues, and write actions.
-- `snapshots.ts`: batched GitHub GraphQL status reads, with pagination only when a connection has more results. Row and scoped refreshes use these snapshots and preserve Linear associations.
+- `linear.ts`: shared issue selection and pagination fields.
+- `context.ts`: batched Linear attachment and identifier resolution. Attachments are authoritative; all matched issues and the association source are retained in `linearContext`, while the primary issue supplies existing group fields.
+- `github.ts`: launch, reviewer, close, and branch-update actions. Launch can reuse the group snapshot.
+- `snapshots.ts`: batched GitHub GraphQL status reads, with pagination only when a connection has more results. Account discovery, row refresh, group refresh, and shipping share snapshot normalization. Scoped refreshes preserve Linear context. Bulk queries omit check annotations to avoid GitHub resource-limit errors.
 - `rebase.ts`: branch comparison and guarded GitHub rebase requests during launch.
-- `discovery.ts`: joins Linear issue trees and GitHub PRs, deduplicates results, and refreshes subsets.
+- `discovery.ts`: reads the authenticated GitHub author's open PR set, then resolves Linear context in batches. Scoped reads bypass discovery. Errors reject the replacement so persisted state survives failed refreshes.
 
 `src/pull-request-matching.ts` contains pure link and issue-reference matching. `src/async.ts` provides bounded workers and deadlines. A deadline stops waiting; it does not cancel an already dispatched HTTP request.
 

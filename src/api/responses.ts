@@ -25,46 +25,6 @@ export interface GitHubPullRequest {
   mergeable: boolean | null;
 }
 
-export interface GitHubComment {
-  user?: GitHubUser;
-  body?: string | null;
-}
-
-export interface GitHubReview extends GitHubComment {
-  state: string;
-}
-
-export interface GitHubCheckRun {
-  id: number;
-  name: string;
-  status: string;
-  conclusion: string | null;
-  output?: { title?: string; summary?: string; text?: string };
-}
-
-export interface GitHubStatus {
-  context: string;
-  state: string;
-  description?: string | null;
-}
-
-export interface GitHubAnnotation {
-  annotation_level: string;
-  path: string;
-  start_line: number;
-  message: string;
-}
-
-export interface GitHubSearchResult {
-  incomplete_results: boolean;
-  items: { html_url: string; draft?: boolean }[];
-}
-
-export type MergeQueueResponse = Record<
-  string,
-  Record<string, { mergeQueueEntry: { id: string } | null }> | null
->;
-
 export interface ReadyForReviewResponse {
   markPullRequestReadyForReview: { pullRequest: { isDraft: boolean } };
 }

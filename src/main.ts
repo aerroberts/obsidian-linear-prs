@@ -62,35 +62,6 @@ export default class LinearPrsPlugin extends Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
-  async loadCachedMergeQueueStatus() {
-    if (!this.settings.githubKey) {
-      return false;
-    }
-    const snapshot = this.metadata.pullRequests;
-    const stale = snapshot.filter((pullRequest) => pullRequest.mergeQueued === undefined);
-    if (!stale.length) {
-      return false;
-    }
-    const refreshed = await withDeadline(
-      fetchSnapshots(this.settings.githubKey, stale),
-      30000,
-      'Merge queue lookup',
-    );
-    if (this.metadata.pullRequests !== snapshot) {
-      return false;
-    }
-    const statuses = new Map(
-      refreshed.map((result) => [
-        result.pullRequest?.id,
-        result.pullRequest?.mergeQueued,
-      ]),
-    );
-    for (const pullRequest of stale) {
-      pullRequest.mergeQueued = statuses.get(pullRequest.id) ?? false;
-    }
-    await this.saveMetadata();
-    return true;
-  }
   async refresh() {
     if (!this.settings.linearKey || !this.settings.githubKey) {
       throw new Error('Enter both API keys in Linear PRs settings.');

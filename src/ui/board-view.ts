@@ -43,23 +43,29 @@ export class BoardView extends ItemView {
       this.focusSearch();
     });
     this.render();
-    if (
-      !this.plugin.metadata.lastRefresh &&
-      this.plugin.settings.linearKey &&
-      this.plugin.settings.githubKey
-    ) {
-      void this.refresh();
-    } else {
-      void this.plugin
-        .loadCachedMergeQueueStatus()
-        .then((changed) => {
-          if (changed) {
-            this.render();
-          }
-        })
-        .catch((e) => new Notice(errorMessage(e), 8000));
+    this.registerInterval(
+      window.setInterval(() => {
+        if (this.app.workspace.getActiveViewOfType(BoardView) === this) {
+          void this.refresh({ quiet: true });
+        }
+      }, 60000),
+    );
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', () => {
+        if (
+          this.app.workspace.getActiveViewOfType(BoardView) === this &&
+          Date.now() - Date.parse(this.plugin.metadata.lastRefresh || '1970-01-01') >=
+            60000
+        ) {
+          void this.refresh({ quiet: true });
+        }
+      }),
+    );
+    if (this.plugin.settings.linearKey && this.plugin.settings.githubKey) {
+      void this.refresh({ quiet: true });
     }
   }
+
   focusSearch() {
     this.searchInput?.focus();
     this.searchInput?.select();
@@ -73,17 +79,25 @@ export class BoardView extends ItemView {
       new Notice(errorMessage(e), 8000);
     }
   }
-  private async refresh() {
-    if (this.busy || this.refreshingGroups.size) {
+  private async refresh(options: { quiet?: boolean } = {}) {
+    if (
+      this.busy ||
+      this.refreshingGroups.size ||
+      this.launching.size ||
+      !this.plugin.settings.linearKey ||
+      !this.plugin.settings.githubKey
+    ) {
       return;
     }
     this.busy = true;
     this.render();
     try {
       const r = await this.plugin.refresh();
-      new Notice(
-        `Linear PRs: ${r.prs.length} open PRs${r.errors.length ? `, ${r.errors.length} lookup errors` : ''}`,
-      );
+      if (!options.quiet) {
+        new Notice(
+          `Linear PRs: ${r.prs.length} open PRs${r.errors.length ? `, ${r.errors.length} lookup errors` : ''}`,
+        );
+      }
       if (r.errors.length) {
         console.warn('Linear PR lookup errors', r.errors);
       }

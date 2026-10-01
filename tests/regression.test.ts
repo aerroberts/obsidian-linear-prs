@@ -728,3 +728,29 @@ test('Linear pagination refuses a missing cursor instead of replacing context', 
     /Missing Linear attachment cursor/,
   );
 });
+
+test('zero and out-of-range incidental identifiers cannot break attachment resolution', async () => {
+  mockRequests(({ body }) => {
+    const payload = JSON.parse(body!);
+    assert.deepEqual(payload.variables.filter.or, [
+      { and: [{ number: { eq: 4777 } }, { team: { key: { eq: 'ENG' } } }] },
+    ]);
+    return {
+      data: {
+        p0: connection([{ issue: linkedIssue }]),
+        references: connection([linkedIssue]),
+      },
+    };
+  });
+  const [pr] = await resolveLinearContexts('linear', [
+    {
+      remote: {
+        ...remotePullRequest,
+        title: 'CVSS-0 ABC-999999999999999999999 ENG-4777',
+        head: { sha: 'head', ref: 'feature' },
+      },
+      pullRequest: createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+    },
+  ]);
+  assert.equal(pr.issueId, 'issue');
+});

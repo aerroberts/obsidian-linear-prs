@@ -1,6 +1,7 @@
 import type { PullRequest } from '../types';
 import type { GitHubPullRequest, GraphqlResponse } from './responses';
 import { requestJson } from './transport';
+import { parsePullRequestUrl } from '../pull-request-matching';
 import { forEachConcurrent } from '../async';
 
 type Actor = { login: string; __typename: string } | null;
@@ -28,7 +29,6 @@ interface Check {
   summary?: string | null;
   text?: string | null;
   description?: string | null;
-  annotations?: Connection<{ annotationLevel: string; message: string; path: string }>;
 }
 interface Snapshot {
   id: string;
@@ -56,17 +56,16 @@ interface Snapshot {
 const PAGE = 'pageInfo { hasNextPage endCursor }';
 const ACTOR = 'author { login __typename }';
 const CHECK_FIELDS = `__typename
-  ... on CheckRun { id name status conclusion title summary text
-    annotations(first:10) { nodes { annotationLevel message path } ${PAGE} } }
+  ... on CheckRun { id name status conclusion title summary }
   ... on StatusContext { context state description }`;
 const FIELDS = `id number title body url state isDraft createdAt headRefOid headRefName
   baseRefName baseRef { target { oid } } mergeable autoMergeRequest { enabledAt }
   mergeQueueEntry { id }
-  reviews(first:100) { nodes { ${ACTOR} state body } ${PAGE} }
-  reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } } } ${PAGE} }
-  comments(first:100) { nodes { ${ACTOR} } ${PAGE} }
-  reviewThreads(first:100) { nodes { id comments(first:10) { nodes { ${ACTOR} } ${PAGE} } } ${PAGE} }
-  statusCheckRollup { id contexts(first:100) { nodes { ${CHECK_FIELDS} } ${PAGE} } }`;
+  reviews(first:20) { nodes { ${ACTOR} state body } ${PAGE} }
+  reviewRequests(first:20) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } } } ${PAGE} }
+  comments(first:20) { nodes { ${ACTOR} } ${PAGE} }
+  reviewThreads(first:10) { nodes { id comments(first:5) { nodes { ${ACTOR} } ${PAGE} } } ${PAGE} }
+  statusCheckRollup { id contexts(first:50) { nodes { ${CHECK_FIELDS} } ${PAGE} } }`;
 
 async function graphql<T>(
   token: string,
@@ -80,7 +79,7 @@ async function graphql<T>(
     { query, variables },
   );
   if (result.errors?.length) {
-    throw new Error(result.errors.map((error) => error.message).join('; '));
+    throw new Error([...new Set(result.errors.map((error) => error.message))].join('; '));
   }
   if (!result.data) {
     throw new Error('GitHub returned no snapshot data.');
@@ -125,8 +124,8 @@ export async function fetchSnapshots(
   previous: PullRequest[],
 ): Promise<PullRequestSnapshot[]> {
   const snapshots: PullRequestSnapshot[] = [];
-  for (let start = 0; start < previous.length; start += 10) {
-    const batch = previous.slice(start, start + 10);
+  for (let start = 0; start < previous.length; start += 100) {
+    const batch = previous.slice(start, start + 100);
     const fields = batch
       .map((pr, index) => {
         const [owner, name] = pr.repo.split('/');
@@ -147,6 +146,66 @@ export async function fetchSnapshots(
     });
   }
   return snapshots;
+}
+
+/** One account-wide read operation, with cursor pages only when GitHub requires them. */
+export async function fetchAuthoredSnapshots(
+  token: string,
+): Promise<PullRequestSnapshot[]> {
+  const snapshots: PullRequestSnapshot[] = [];
+  let after: string | null = null;
+  do {
+    const result: { search: Connection<Snapshot> & { issueCount: number } } =
+      await graphql(
+        token,
+        `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}}}`,
+        { after },
+      );
+    if (result.search.issueCount > 1000) {
+      throw new Error(
+        'GitHub search exceeds its 1,000-result limit; cached board was retained.',
+      );
+    }
+    const page = result.search;
+    await forEachConcurrent(page.nodes, 4, async (snapshot) => {
+      const reference = parsePullRequestUrl(snapshot.url);
+      if (!reference) {
+        throw new Error(`Invalid GitHub PR URL: ${snapshot.url}`);
+      }
+      snapshots.push(
+        await normalizeSnapshot(token, createPullRequestReference(reference), snapshot),
+      );
+    });
+    if (page.pageInfo.hasNextPage && !page.pageInfo.endCursor) {
+      throw new Error('Missing GitHub search cursor.');
+    }
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return snapshots;
+}
+
+export function createPullRequestReference(reference: {
+  repo: string;
+  number: number;
+}): PullRequest {
+  return {
+    ...reference,
+    id: `${reference.repo}#${reference.number}`,
+    url: `https://github.com/${reference.repo}/pull/${reference.number}`,
+    title: '',
+    draft: false,
+    state: 'open',
+    createdAt: '',
+    issueId: '',
+    groupId: 'unlinked',
+    groupTitle: '',
+    groupUrl: '',
+    checks: [],
+    reviewers: [],
+    automerge: false,
+    conflicts: false,
+    comments: false,
+  };
 }
 
 async function normalizeSnapshot(
@@ -202,7 +261,7 @@ async function normalizeSnapshot(
       snapshot.id,
       'PullRequest',
       'reviewThreads',
-      `id comments(first:10){nodes{${ACTOR}} ${PAGE}}`,
+      `id comments(first:5){nodes{${ACTOR}} ${PAGE}}`,
       snapshot.reviewThreads,
     ),
     snapshot.statusCheckRollup
@@ -270,7 +329,7 @@ async function normalizeSnapshot(
         ? ['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(context.conclusion ?? '')
         : context.state === 'SUCCESS';
     const status = pending ? 'pending' : success ? 'success' : 'failure';
-    let detail = [
+    const detail = [
       context.title !== context.name ? context.title : '',
       context.summary,
       context.text,
@@ -281,22 +340,6 @@ async function normalizeSnapshot(
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 240);
-    if (status === 'failure' && !detail && context.annotations) {
-      const annotations = await completeConnection(
-        token,
-        context.id ?? snapshot.id,
-        'CheckRun',
-        'annotations',
-        'annotationLevel message path',
-        context.annotations,
-      );
-      const failure = annotations.find(
-        (annotation) => annotation.annotationLevel === 'FAILURE',
-      );
-      if (failure) {
-        detail = `${failure.path}: ${failure.message}`.replace(/\s+/g, ' ').slice(0, 240);
-      }
-    }
     checks.push({
       name: context.name ?? context.context ?? 'Check',
       status,

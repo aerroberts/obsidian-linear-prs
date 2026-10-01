@@ -6,14 +6,6 @@ export type Issue = {
   state?: { type: string };
   project?: { id: string; name: string; url: string } | null;
   parent?: { id: string; title: string; url: string } | null;
-  attachments?: {
-    nodes: { url: string }[];
-    pageInfo: { hasNextPage: boolean; endCursor: string | null };
-  };
-  children?: {
-    nodes: Issue[];
-    pageInfo: { hasNextPage: boolean; endCursor: string | null };
-  };
 };
 export type PullRequest = {
   id: string;
@@ -24,6 +16,7 @@ export type PullRequest = {
   draft: boolean;
   state: string;
   createdAt: string;
+  linearContext?: { issues: Issue[]; source: 'attachment' | 'reference' | 'none' };
   issueId: string;
   issueTitle?: string;
   issueUrl?: string;

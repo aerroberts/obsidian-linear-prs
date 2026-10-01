@@ -1,15 +1,16 @@
-import { fetchSnapshots } from '../src/api/snapshots';
+import {
+  fetchSnapshots,
+  fetchAuthoredSnapshots,
+  createPullRequestReference,
+} from '../src/api/snapshots';
+import { discover, refreshPrs } from '../src/api/discovery';
+import { resolveLinearContexts } from '../src/api/context';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { migrateMetadata, createEmptyMetadata } from '../src/metadata';
 import { parsePullRequestUrl, referencedIdentifiers } from '../src/pull-request-matching';
 import { forEachConcurrent, withDeadline } from '../src/async';
-import {
-  fetchPullRequest,
-  launchPr,
-  markMergeQueued,
-  updatePrBranch,
-} from '../src/api/github';
+import { launchPr, updatePrBranch } from '../src/api/github';
 import { rebasePullRequest } from '../src/api/rebase';
 
 function mockRequests(
@@ -43,46 +44,21 @@ const remotePullRequest = {
   mergeable: true,
 };
 
-function mockPullRequestDetails() {
-  mockRequests(({ url }) => {
-    if (url.endsWith('/pulls/42')) return remotePullRequest;
-    if (url.includes('/reviews'))
-      return [
-        { user: { login: 'reviewer', type: 'User' }, state: 'APPROVED' },
-        {
-          user: { login: 'reviewer', type: 'User' },
-          state: 'COMMENTED',
-          body: 'Looks good',
-        },
-      ];
-    if (url.includes('/check-runs'))
-      return {
-        check_runs: [
-          { id: 1, name: 'Optional', status: 'completed', conclusion: 'skipped' },
-          {
-            id: 2,
-            name: 'Lint',
-            status: 'completed',
-            conclusion: 'failure',
-            output: { summary: 'Bad syntax' },
-          },
-        ],
-      };
-    if (url.endsWith('/status')) return { statuses: [] };
-    return [];
-  });
-}
-
 test('migrates legacy queues without losing board state or mutating input', () => {
   const saved = {
     ...createEmptyMetadata(),
-    reviewTypes: { one: 'review' as const, two: 'stamp' as const, three: 'C' as const },
+    reviewTypes: {
+      one: 'review' as const,
+      two: 'stamp' as const,
+      three: 'C' as const,
+      four: 'D' as const,
+    },
     collapsed: ['queue:review', 'queue:stamp', 'group'],
     hidden: ['closed'],
     reviewMessage: ['one'],
   };
   const migrated = migrateMetadata(saved);
-  assert.deepEqual(migrated.reviewTypes, { one: 'A', two: 'B', three: 'C' });
+  assert.deepEqual(migrated.reviewTypes, { one: 'A', two: 'B', three: 'C', four: 'D' });
   assert.deepEqual(migrated.collapsed, ['queue:A', 'queue:B', 'group']);
   assert.deepEqual(migrated.hidden, ['closed']);
   assert.deepEqual(migrated.reviewMessage, ['one']);
@@ -138,44 +114,20 @@ test('deadlines return results and reject stalled work', async () => {
 });
 
 test('normalizes checks, preserves approval, and detects review comments', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  mockRequests(() => ({ data: { p0: { pullRequest: graphSnapshot() } } }));
+  const [snapshot] = await fetchSnapshots('github', [
+    createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+  ]);
+  const pullRequest = snapshot.pullRequest;
   assert.ok(pullRequest);
   assert.deepEqual(pullRequest.reviewers, [{ login: 'reviewer', status: 'approved' }]);
   assert.equal(pullRequest.comments, true);
   assert.equal(pullRequest.checks[0].status, 'success');
-  assert.equal(pullRequest.checks[1].detail, 'Bad syntax');
-  assert.equal(pullRequest.groupId, 'unlinked');
-});
-
-test('rejects false issue matches and ignores closed PRs', async () => {
-  mockPullRequestDetails();
-  const issue = {
-    id: 'issue',
-    identifier: 'ABC-12',
-    title: 'Task',
-    url: 'https://linear.app/issue/ABC-12',
-  };
-  assert.equal(
-    await fetchPullRequest('test-token', 'owner/repo', 42, issue, false),
-    null,
-  );
-  mockRequests(() => ({ ...remotePullRequest, state: 'closed' }));
-  assert.equal(await fetchPullRequest('test-token', 'owner/repo', 42), null);
-});
-
-test('merge queue lookup updates only the returned PR entries', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
-  assert.ok(pullRequest);
-  mockRequests(() => ({ data: { r0: { p0: { mergeQueueEntry: { id: 'entry' } } } } }));
-  await markMergeQueued('test-token', [pullRequest]);
-  assert.equal(pullRequest.mergeQueued, true);
+  assert.equal(pullRequest.checks[2].detail, 'Bad syntax');
 });
 
 test('launch reports ready status when GitHub refuses auto-merge', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   let markedReady = false;
   mockRequests(({ url, body }) => {
@@ -197,8 +149,7 @@ test('launch reports ready status when GitHub refuses auto-merge', async () => {
 });
 
 test('launch verifies a guarded rebase before ready and auto-merge', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   const actions: string[] = [];
   mockRequests(({ url, body }) => {
@@ -241,8 +192,7 @@ test('launch verifies a guarded rebase before ready and auto-merge', async () =>
 });
 
 test('launch skips rebasing an up-to-date branch', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   mockRequests(({ url, body }) => {
     if (url.endsWith('/pulls/42')) return remotePullRequest;
@@ -256,8 +206,7 @@ test('launch skips rebasing an up-to-date branch', async () => {
 });
 
 test('launch attempts rebasing even when auto-merge is already enabled', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   let requested = false;
   mockRequests(({ url, body }) => {
@@ -278,8 +227,7 @@ test('launch attempts rebasing even when auto-merge is already enabled', async (
 });
 
 test('rebase conflicts warn while launch continues', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   mockRequests(({ url, body }) => {
     if (url.endsWith('/pulls/42')) return { ...remotePullRequest, mergeable: false };
@@ -293,8 +241,7 @@ test('rebase conflicts warn while launch continues', async () => {
 });
 
 test('rejected rebases warn without blocking remaining launch actions', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   for (const message of ['Resource not accessible', 'Head branch changed']) {
     mockRequests(({ url, body }) => {
@@ -314,8 +261,7 @@ test('rejected rebases warn without blocking remaining launch actions', async ()
 });
 
 test('closed PRs never trigger a rebase or launch mutation', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   let requests = 0;
   mockRequests(({ url }) => {
@@ -391,8 +337,7 @@ test('verification waits for asynchronous branch updates', async () => {
 });
 
 test('row branch refresh uses current GitHub state without ready or auto-merge mutations', async () => {
-  mockPullRequestDetails();
-  const pullRequest = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const pullRequest = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(pullRequest);
   let latestFetched = false;
   mockRequests(({ url, body }) => {
@@ -472,8 +417,7 @@ function graphSnapshot() {
 }
 
 test('batched status read preserves associations and normalizes badges in one request', async () => {
-  mockPullRequestDetails();
-  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(previous);
   previous.groupId = 'linear-group';
   previous.issueId = 'linear-issue';
@@ -511,16 +455,14 @@ test('batched status read preserves associations and normalizes badges in one re
 });
 
 test('snapshot errors reject rather than overwriting cached PRs with partial data', async () => {
-  mockPullRequestDetails();
-  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(previous);
   mockRequests(() => ({ errors: [{ message: 'Not accessible' }], data: { p0: null } }));
   await assert.rejects(fetchSnapshots('test-token', [previous]), /Not accessible/);
 });
 
 test('snapshots paginate additional reviews only when needed', async () => {
-  mockPullRequestDetails();
-  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(previous);
   let requests = 0;
   const snapshot = graphSnapshot();
@@ -550,8 +492,7 @@ test('snapshots paginate additional reviews only when needed', async () => {
 });
 
 test('closed snapshots remove PRs and an empty refresh makes no requests', async () => {
-  mockPullRequestDetails();
-  const previous = await fetchPullRequest('test-token', 'owner/repo', 42);
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
   assert.ok(previous);
   let requests = 0;
   mockRequests(() => {
@@ -561,4 +502,229 @@ test('closed snapshots remove PRs and an empty refresh makes no requests', async
   assert.equal((await fetchSnapshots('test-token', [previous]))[0].pullRequest, null);
   assert.deepEqual(await fetchSnapshots('test-token', []), []);
   assert.equal(requests, 1);
+});
+
+test('existing group refresh reads more than ten PRs in one GitHub query', async () => {
+  const previous = Array.from({ length: 24 }, (_, index) => ({
+    ...createPullRequestReference({ repo: 'owner/repo', number: index + 1 }),
+    groupId: 'parent',
+    issueId: 'issue',
+  }));
+  let calls = 0;
+  mockRequests(({ url, body }) => {
+    calls++;
+    assert.equal(url, 'https://api.github.com/graphql');
+    assert.match(JSON.parse(body!).query, /p23:/);
+    return {
+      data: Object.fromEntries(
+        previous.map((pr, index) => [
+          `p${index}`,
+          { pullRequest: { ...graphSnapshot(), number: pr.number, url: pr.url } },
+        ]),
+      ),
+    };
+  });
+  const result = await refreshPrs({ githubKey: 'github', linearKey: 'linear' }, previous);
+  assert.equal(calls, 1);
+  assert.equal(result.length, 24);
+  assert.ok(result.every((pr) => pr.groupId === 'parent' && pr.issueId === 'issue'));
+});
+
+const linkedIssue = {
+  id: 'issue',
+  identifier: 'ENG-4777',
+  title: 'Converge work contracts',
+  url: 'https://linear.app/casco/issue/ENG-4777',
+  parent: {
+    id: 'parent',
+    title: 'Data Access',
+    url: 'https://linear.app/casco/issue/ENG-3856',
+  },
+};
+
+test('full refresh uses two service queries and attaches PR context without text identifiers', async () => {
+  let calls = 0;
+  mockRequests(({ url, body }) => {
+    calls++;
+    const query = JSON.parse(body!).query;
+    if (url.includes('github.com')) {
+      assert.match(query, /author:@me/);
+      return {
+        data: {
+          search: {
+            ...connection([
+              {
+                ...graphSnapshot(),
+                number: 6381,
+                title: 'Refactor work contracts',
+                headRefName: 'eric/work-datastore2',
+                url: 'https://github.com/agentruntime/casco/pull/6381',
+              },
+            ]),
+            issueCount: 1,
+          },
+        },
+      };
+    }
+    assert.match(query, /attachmentsForURL/);
+    assert.match(query, /nodes\{issue\{/);
+    return { data: { p0: connection([{ issue: linkedIssue }]) } };
+  });
+  const result = await discover({ githubKey: 'github', linearKey: 'linear' });
+  assert.equal(calls, 2);
+  assert.equal(result.prs[0].issueId, 'issue');
+  assert.equal(result.prs[0].groupId, 'parent');
+  assert.equal(result.prs[0].linearContext?.source, 'attachment');
+});
+
+test('attachment context wins over incidental identifiers and preserves all linked issues', async () => {
+  const remote = { ...remotePullRequest, title: 'ENG-99 is unrelated' };
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
+  const other = { ...linkedIssue, id: 'other', identifier: 'ENG-99' };
+  mockRequests(({ body }) => {
+    assert.deepEqual(JSON.parse(body!).variables.filter.or[0].and[0], {
+      number: { eq: 99 },
+    });
+    return {
+      data: {
+        p0: connection([
+          { issue: linkedIssue },
+          { issue: linkedIssue },
+          { issue: { ...linkedIssue, id: 'second', identifier: 'ENG-5000' } },
+        ]),
+        references: connection([other]),
+      },
+    };
+  });
+  const [pr] = await resolveLinearContexts('linear', [{ remote, pullRequest: previous }]);
+  assert.equal(pr.issueId, 'issue');
+  assert.equal(pr.linearContext?.issues.length, 2);
+  assert.equal(pr.linearContext?.source, 'attachment');
+});
+
+test('identifier fallback is batched and real unlinked PRs remain visible', async () => {
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
+  mockRequests(() => ({
+    data: { p0: connection(), p1: connection(), references: connection([linkedIssue]) },
+  }));
+  const result = await resolveLinearContexts('linear', [
+    {
+      remote: {
+        ...remotePullRequest,
+        title: 'ENG-4777',
+        body: null,
+        head: { sha: 'head', ref: 'feature' },
+      },
+      pullRequest: previous,
+    },
+    {
+      remote: {
+        ...remotePullRequest,
+        title: 'Unrelated',
+        body: null,
+        head: { sha: 'head', ref: 'feature' },
+      },
+      pullRequest: { ...previous, number: 43 },
+    },
+  ]);
+  assert.equal(result[0].linearContext?.source, 'reference');
+  assert.equal(result[1].groupId, 'unlinked');
+  assert.equal(result.length, 2);
+});
+
+test('account search follows cursors and refuses the GitHub search truncation limit', async () => {
+  let calls = 0;
+  mockRequests(({ body }) => {
+    calls++;
+    const after = JSON.parse(body!).variables.after;
+    if (after === null)
+      return {
+        data: {
+          search: {
+            nodes: [graphSnapshot()],
+            issueCount: 2,
+            pageInfo: { hasNextPage: true, endCursor: 'next' },
+          },
+        },
+      };
+    assert.equal(after, 'next');
+    return {
+      data: {
+        search: { ...connection([{ ...graphSnapshot(), number: 43 }]), issueCount: 2 },
+      },
+    };
+  });
+  assert.equal((await fetchAuthoredSnapshots('github')).length, 2);
+  assert.equal(calls, 2);
+  mockRequests(() => ({ data: { search: { ...connection(), issueCount: 1001 } } }));
+  await assert.rejects(fetchAuthoredSnapshots('github'), /1,000-result/);
+});
+
+test('Linear failures reject the refresh instead of classifying associated PRs as unlinked', async () => {
+  mockRequests(() => ({ errors: [{ message: 'Permission denied' }] }));
+  await assert.rejects(
+    resolveLinearContexts('linear', [
+      {
+        remote: remotePullRequest,
+        pullRequest: createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+      },
+    ]),
+    /Permission denied/,
+  );
+});
+
+test('shipping can reuse its group snapshot without another PR detail read', async () => {
+  let details = 0;
+  mockRequests(({ url }) => {
+    if (url.endsWith('/pulls/42')) {
+      details++;
+      throw new Error('Unexpected detail read');
+    }
+    if (url.includes('/compare/')) return { behind_by: 0 };
+    return { data: { enablePullRequestAutoMerge: { clientMutationId: null } } };
+  });
+  const result = await launchPr(
+    { githubKey: 'github', linearKey: 'linear' },
+    createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+    { ...remotePullRequest, auto_merge: {} },
+  );
+  assert.equal(details, 0);
+  assert.equal(result.automergeEnabled, true);
+});
+
+test('Linear attachment pagination keeps context from later pages', async () => {
+  let calls = 0;
+  mockRequests(({ body }) => {
+    calls++;
+    const payload = JSON.parse(body!);
+    if (calls === 1)
+      return {
+        data: { p0: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'next' } } },
+      };
+    assert.equal(payload.variables.after, 'next');
+    return { data: { attachmentsForURL: connection([{ issue: linkedIssue }]) } };
+  });
+  const [pr] = await resolveLinearContexts('linear', [
+    {
+      remote: remotePullRequest,
+      pullRequest: createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+    },
+  ]);
+  assert.equal(pr.issueId, 'issue');
+  assert.equal(calls, 2);
+});
+
+test('Linear pagination refuses a missing cursor instead of replacing context', async () => {
+  mockRequests(() => ({
+    data: { p0: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } },
+  }));
+  await assert.rejects(
+    resolveLinearContexts('linear', [
+      {
+        remote: remotePullRequest,
+        pullRequest: createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+      },
+    ]),
+    /Missing Linear attachment cursor/,
+  );
 });

@@ -67,6 +67,20 @@ async function requestGitHub(token, path, method = "GET", body) {
   return requestJson(`https://api.github.com${path}`, method, `Bearer ${token}`, body);
 }
 
+// src/pull-request-matching.ts
+var prPattern = /https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/i;
+function parsePullRequestUrl(url) {
+  const m = url.match(prPattern);
+  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
+}
+function referencedIdentifiers(pr) {
+  return [
+    ...new Set(
+      ([pr.title ?? "", pr.body ?? "", pr.head?.ref ?? ""].join("\n").match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi) ?? []).map((id) => id.toUpperCase())
+    )
+  ];
+}
+
 // src/async.ts
 async function forEachConcurrent(items, limit, fn) {
   let index = 0;
@@ -102,17 +116,16 @@ async function withDeadline(task, milliseconds, label) {
 var PAGE = "pageInfo { hasNextPage endCursor }";
 var ACTOR = "author { login __typename }";
 var CHECK_FIELDS = `__typename
-  ... on CheckRun { id name status conclusion title summary text
-    annotations(first:10) { nodes { annotationLevel message path } ${PAGE} } }
+  ... on CheckRun { id name status conclusion title summary }
   ... on StatusContext { context state description }`;
 var FIELDS = `id number title body url state isDraft createdAt headRefOid headRefName
   baseRefName baseRef { target { oid } } mergeable autoMergeRequest { enabledAt }
   mergeQueueEntry { id }
-  reviews(first:100) { nodes { ${ACTOR} state body } ${PAGE} }
-  reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } } } ${PAGE} }
-  comments(first:100) { nodes { ${ACTOR} } ${PAGE} }
-  reviewThreads(first:100) { nodes { id comments(first:10) { nodes { ${ACTOR} } ${PAGE} } } ${PAGE} }
-  statusCheckRollup { id contexts(first:100) { nodes { ${CHECK_FIELDS} } ${PAGE} } }`;
+  reviews(first:20) { nodes { ${ACTOR} state body } ${PAGE} }
+  reviewRequests(first:20) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } } } ${PAGE} }
+  comments(first:20) { nodes { ${ACTOR} } ${PAGE} }
+  reviewThreads(first:10) { nodes { id comments(first:5) { nodes { ${ACTOR} } ${PAGE} } } ${PAGE} }
+  statusCheckRollup { id contexts(first:50) { nodes { ${CHECK_FIELDS} } ${PAGE} } }`;
 async function graphql(token, query, variables) {
   const result = await requestJson(
     "https://api.github.com/graphql",
@@ -121,7 +134,7 @@ async function graphql(token, query, variables) {
     { query, variables }
   );
   if (result.errors?.length) {
-    throw new Error(result.errors.map((error) => error.message).join("; "));
+    throw new Error([...new Set(result.errors.map((error) => error.message))].join("; "));
   }
   if (!result.data) {
     throw new Error("GitHub returned no snapshot data.");
@@ -148,8 +161,8 @@ async function completeConnection(token, id, type, field, fields, connection) {
 }
 async function fetchSnapshots(token, previous) {
   const snapshots = [];
-  for (let start = 0; start < previous.length; start += 10) {
-    const batch = previous.slice(start, start + 10);
+  for (let start = 0; start < previous.length; start += 100) {
+    const batch = previous.slice(start, start + 100);
     const fields = batch.map((pr, index) => {
       const [owner, name] = pr.repo.split("/");
       return `p${index}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequest(number:${pr.number}){${FIELDS}}}`;
@@ -168,6 +181,57 @@ async function fetchSnapshots(token, previous) {
     });
   }
   return snapshots;
+}
+async function fetchAuthoredSnapshots(token) {
+  const snapshots = [];
+  let after = null;
+  do {
+    const result = await graphql(
+      token,
+      `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}}}`,
+      { after }
+    );
+    if (result.search.issueCount > 1e3) {
+      throw new Error(
+        "GitHub search exceeds its 1,000-result limit; cached board was retained."
+      );
+    }
+    const page = result.search;
+    await forEachConcurrent(page.nodes, 4, async (snapshot) => {
+      const reference = parsePullRequestUrl(snapshot.url);
+      if (!reference) {
+        throw new Error(`Invalid GitHub PR URL: ${snapshot.url}`);
+      }
+      snapshots.push(
+        await normalizeSnapshot(token, createPullRequestReference(reference), snapshot)
+      );
+    });
+    if (page.pageInfo.hasNextPage && !page.pageInfo.endCursor) {
+      throw new Error("Missing GitHub search cursor.");
+    }
+    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return snapshots;
+}
+function createPullRequestReference(reference) {
+  return {
+    ...reference,
+    id: `${reference.repo}#${reference.number}`,
+    url: `https://github.com/${reference.repo}/pull/${reference.number}`,
+    title: "",
+    draft: false,
+    state: "open",
+    createdAt: "",
+    issueId: "",
+    groupId: "unlinked",
+    groupTitle: "",
+    groupUrl: "",
+    checks: [],
+    reviewers: [],
+    automerge: false,
+    conflicts: false,
+    comments: false
+  };
 }
 async function normalizeSnapshot(token, previous, snapshot) {
   const remote = {
@@ -217,7 +281,7 @@ async function normalizeSnapshot(token, previous, snapshot) {
       snapshot.id,
       "PullRequest",
       "reviewThreads",
-      `id comments(first:10){nodes{${ACTOR}} ${PAGE}}`,
+      `id comments(first:5){nodes{${ACTOR}} ${PAGE}}`,
       snapshot.reviewThreads
     ),
     snapshot.statusCheckRollup ? completeConnection(
@@ -269,28 +333,12 @@ async function normalizeSnapshot(token, previous, snapshot) {
     const pending = context.__typename === "CheckRun" ? context.status !== "COMPLETED" : ["PENDING", "EXPECTED"].includes(context.state ?? "");
     const success = context.__typename === "CheckRun" ? ["SUCCESS", "NEUTRAL", "SKIPPED"].includes(context.conclusion ?? "") : context.state === "SUCCESS";
     const status = pending ? "pending" : success ? "success" : "failure";
-    let detail = [
+    const detail = [
       context.title !== context.name ? context.title : "",
       context.summary,
       context.text,
       context.description
     ].filter(Boolean).join(" \u2014 ").replace(/\s+/g, " ").trim().slice(0, 240);
-    if (status === "failure" && !detail && context.annotations) {
-      const annotations = await completeConnection(
-        token,
-        context.id ?? snapshot.id,
-        "CheckRun",
-        "annotations",
-        "annotationLevel message path",
-        context.annotations
-      );
-      const failure = annotations.find(
-        (annotation) => annotation.annotationLevel === "FAILURE"
-      );
-      if (failure) {
-        detail = `${failure.path}: ${failure.message}`.replace(/\s+/g, " ").slice(0, 240);
-      }
-    }
     checks.push({
       name: context.name ?? context.context ?? "Check",
       status,
@@ -398,585 +446,101 @@ async function compareWithCurrentBase(token, repo, pullRequest) {
 // src/main.ts
 var import_obsidian6 = require("obsidian");
 
-// src/pull-request-matching.ts
-var prPattern = /https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)/i;
-function parsePullRequestUrl(url) {
-  const m = url.match(prPattern);
-  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
-}
-function referencedIdentifiers(pr) {
-  return [
-    ...new Set(
-      ([pr.title ?? "", pr.body ?? "", pr.head?.ref ?? ""].join("\n").match(/\b[A-Z][A-Z0-9]{1,14}-\d+\b/gi) ?? []).map((id) => id.toUpperCase())
-    )
-  ];
-}
-
 // src/api/linear.ts
 var ISSUE_FIELDS = "id identifier title url state { type } project { id name url } parent { id title url }";
 var PAGE2 = "pageInfo { hasNextPage endCursor }";
-async function assignedRoots(key) {
-  const roots = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($after:String){viewer{assignedIssues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE2}}}}`,
-      { after }
-    );
-    const page = data.viewer.assignedIssues;
-    roots.push(
-      ...page.nodes.filter(
-        (i) => !["completed", "canceled"].includes(i.state?.type ?? "")
-      )
-    );
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return roots;
-}
-async function issueChildren(key, id) {
-  const children = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($id:String!,$after:String){issue(id:$id){children(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE2}}}}`,
-      { id, after }
-    );
-    const page = data.issue.children;
-    children.push(...page.nodes);
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return children;
-}
-async function projectIssues(key, id) {
-  const issues = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($id:String!,$after:String){project(id:$id){issues(first:100,after:$after){nodes{${ISSUE_FIELDS}} ${PAGE2}}}}`,
-      { id, after }
-    );
-    const page = data.project.issues;
-    issues.push(...page.nodes);
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return issues;
-}
-async function issueById(key, id) {
-  const data = await queryLinear(
-    key,
-    `query($id:String!){issue(id:$id){${ISSUE_FIELDS}}}`,
-    { id }
-  );
-  return data.issue;
-}
-async function attachmentUrls(key, id) {
-  const urls = [];
-  let after = null;
-  do {
-    const data = await queryLinear(
-      key,
-      `query($id:String!,$after:String){issue(id:$id){attachments(first:100,after:$after){nodes{url} ${PAGE2}}}}`,
-      { id, after }
-    );
-    const page = data.issue.attachments;
-    urls.push(...page.nodes.map((n) => n.url));
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
-  return urls;
-}
-async function attachedPrUrls(key, urls) {
-  const linked = /* @__PURE__ */ new Set();
-  for (let start = 0; start < urls.length; start += 20) {
-    const batch = urls.slice(start, start + 20);
-    const fields = batch.map((url, i) => `a${i}:attachmentsForURL(url:${JSON.stringify(url)}){nodes{id}}`).join(" ");
-    const data = await queryLinear(
-      key,
-      `query{${fields}}`
-    );
-    batch.forEach((url, i) => {
-      if (data[`a${i}`]?.nodes.length) {
-        linked.add(url);
-      }
-    });
-  }
-  return linked;
-}
 
-// src/api/github.ts
-async function openRepoPulls(token, repo) {
-  const pulls = [];
-  for (let page = 1; ; page++) {
-    const batch = await requestGitHub(
-      token,
-      `/repos/${repo}/pulls?state=open&per_page=100&page=${page}`
+// src/api/context.ts
+async function resolveLinearContexts(key, snapshots) {
+  const open = snapshots.filter((snapshot) => snapshot.pullRequest !== null);
+  const results = [];
+  for (let start = 0; start < open.length; start += 100) {
+    const batch = open.slice(start, start + 100);
+    const identifiers = [
+      ...new Set(batch.flatMap((snapshot) => referencedIdentifiers(snapshot.remote)))
+    ];
+    const filters = identifiers.map((identifier) => {
+      const split = identifier.lastIndexOf("-");
+      return {
+        and: [
+          { number: { eq: Number(identifier.slice(split + 1)) } },
+          { team: { key: { eq: identifier.slice(0, split) } } }
+        ]
+      };
+    });
+    const fields = batch.map(
+      (snapshot, index) => `p${index}:attachmentsForURL(url:${JSON.stringify(snapshot.remote.html_url)},first:5,includeArchived:true){nodes{issue{${ISSUE_FIELDS}}} ${PAGE2}}`
+    ).join("\n");
+    const response = await queryLinear(
+      key,
+      `query ResolvePullRequestContexts${filters.length ? "($filter:IssueFilter!)" : ""}{${fields} ${filters.length ? `references:issues(first:100,includeArchived:true,filter:$filter){nodes{${ISSUE_FIELDS}} ${PAGE2}}` : ""}}`,
+      filters.length ? { filter: { or: filters } } : {}
     );
-    pulls.push(...batch);
-    if (batch.length < 100) {
-      break;
-    }
-  }
-  return pulls;
-}
-async function fetchPullRequest(token, repo, number, issue, attached = true, prefetched) {
-  const path = `/repos/${repo}/pulls/${number}`;
-  const pullRequest = prefetched ?? await requestGitHub(token, path);
-  if (pullRequest.state !== "open") {
-    return null;
-  }
-  if (issue && !attached) {
-    const pattern = new RegExp(
-      `(^|[^A-Za-z0-9])${issue.identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9]|$)`,
-      "i"
-    );
-    if (!pattern.test(
-      [pullRequest.title, pullRequest.body ?? "", pullRequest.head?.ref ?? ""].join(
-        "\n"
-      )
-    )) {
-      return null;
-    }
-  }
-  const [reviews, checkRuns, status, reviewComments, issueComments] = await Promise.allSettled([
-    requestGitHub(token, `${path}/reviews?per_page=100`),
-    requestGitHub(
-      token,
-      `/repos/${repo}/commits/${pullRequest.head.sha}/check-runs?per_page=100`
-    ),
-    requestGitHub(
-      token,
-      `/repos/${repo}/commits/${pullRequest.head.sha}/status`
-    ),
-    requestGitHub(token, `${path}/comments?per_page=100`),
-    requestGitHub(
-      token,
-      `/repos/${repo}/issues/${number}/comments?per_page=100`
-    )
-  ]);
-  const reviewerMap = /* @__PURE__ */ new Map();
-  const reviewItems = reviews.status === "fulfilled" ? reviews.value : [];
-  for (const review of reviewItems) {
-    if (!review.user?.login || !["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(review.state)) {
-      continue;
-    }
-    const previous = reviewerMap.get(review.user.login);
-    if (review.state === "COMMENTED" && previous && previous !== "commented") {
-      continue;
-    }
-    reviewerMap.set(review.user.login, review.state.toLowerCase());
-  }
-  for (const review of pullRequest.requested_reviewers ?? []) {
-    if (!reviewerMap.has(review.login)) {
-      reviewerMap.set(review.login, "requested");
-    }
-  }
-  const checks = [];
-  const missingCheckDetails = [];
-  if (checkRuns.status === "fulfilled") {
-    for (const checkRun of checkRuns.value.check_runs ?? []) {
-      const state = checkRun.status !== "completed" ? "pending" : ["success", "neutral", "skipped"].includes(checkRun.conclusion ?? "") ? "success" : "failure";
-      const output = [
-        checkRun.conclusion && checkRun.conclusion !== "failure" ? String(checkRun.conclusion).replace(/_/g, " ") : "",
-        checkRun.output?.title !== checkRun.name ? checkRun.output?.title : "",
-        checkRun.output?.summary,
-        checkRun.output?.text
-      ].filter(Boolean).join(" \u2014 ").replace(/\s+/g, " ").trim();
-      if (state === "failure" && !output && checkRun.id) {
-        missingCheckDetails.push({ id: checkRun.id, index: checks.length });
+    const referenced = [...response.references?.nodes ?? []];
+    let referencePage = response.references?.pageInfo;
+    while (referencePage?.hasNextPage) {
+      if (!referencePage.endCursor) {
+        throw new Error("Missing Linear reference cursor.");
       }
-      checks.push({
-        name: checkRun.name,
-        status: state,
-        detail: state === "failure" ? output.slice(0, 240) : void 0
+      const next = await queryLinear(
+        key,
+        `query($filter:IssueFilter!,$after:String!){issues(first:100,includeArchived:true,after:$after,filter:$filter){nodes{${ISSUE_FIELDS}} ${PAGE2}}}`,
+        { filter: { or: filters }, after: referencePage.endCursor }
+      );
+      referenced.push(...next.issues.nodes);
+      referencePage = next.issues.pageInfo;
+    }
+    const issuesByIdentifier = new Map(
+      referenced.map((issue) => [issue.identifier.toUpperCase(), issue])
+    );
+    for (const [index, snapshot] of batch.entries()) {
+      const connection = response[`p${index}`];
+      if (!connection) {
+        throw new Error(`Missing Linear context for ${snapshot.remote.html_url}.`);
+      }
+      const attachments = [...connection.nodes];
+      let page = connection.pageInfo;
+      while (page.hasNextPage) {
+        if (!page.endCursor) {
+          throw new Error("Missing Linear attachment cursor.");
+        }
+        const next = await queryLinear(
+          key,
+          `query($url:String!,$after:String!){attachmentsForURL(url:$url,first:100,includeArchived:true,after:$after){nodes{issue{${ISSUE_FIELDS}}} ${PAGE2}}}`,
+          { url: snapshot.remote.html_url, after: page.endCursor }
+        );
+        attachments.push(...next.attachmentsForURL.nodes);
+        page = next.attachmentsForURL.pageInfo;
+      }
+      const linked = attachments.map((attachment) => attachment.issue).filter((issue2) => !!issue2);
+      const fallback = referencedIdentifiers(snapshot.remote).map((id) => issuesByIdentifier.get(id)).filter((issue2) => !!issue2);
+      const source = linked.length ? "attachment" : fallback.length ? "reference" : "none";
+      const issues = [
+        ...new Map(
+          (linked.length ? linked : fallback).map((issue2) => [issue2.id, issue2])
+        ).values()
+      ].sort((left, right) => left.identifier.localeCompare(right.identifier));
+      const issue = issues[0];
+      results.push({
+        ...snapshot.pullRequest,
+        linearContext: { issues, source },
+        issueId: issue?.id ?? "",
+        issueTitle: issue?.title,
+        issueUrl: issue?.url,
+        groupId: issue ? issue.parent?.id ?? issue.project?.id ?? "unparented" : "unlinked",
+        groupTitle: issue ? issue.parent?.title ?? issue.project?.name ?? "Unparented issues" : "",
+        groupUrl: issue ? issue.parent?.url ?? issue.project?.url ?? "" : ""
       });
     }
   }
-  await Promise.allSettled(
-    missingCheckDetails.slice(0, 8).map(async ({ id, index }) => {
-      const annotations = await requestGitHub(
-        token,
-        `/repos/${repo}/check-runs/${id}/annotations?per_page=100`
-      );
-      const failures = annotations.filter(
-        (annotation) => annotation.annotation_level === "failure"
-      );
-      const first = failures[0];
-      if (first) {
-        checks[index].detail = [
-          first.path && first.start_line ? `${first.path}:${first.start_line}` : "",
-          first.message
-        ].filter(Boolean).join(" \u2014 ").replace(/\s+/g, " ").trim().slice(0, 240);
-      }
-    })
-  );
-  if (status.status === "fulfilled") {
-    for (const commitStatus of status.value.statuses ?? []) {
-      const state = commitStatus.state === "success" ? "success" : commitStatus.state === "pending" ? "pending" : "failure";
-      checks.push({
-        name: commitStatus.context,
-        status: state,
-        detail: state === "failure" ? String(commitStatus.description ?? "").replace(/\s+/g, " ").trim().slice(0, 240) : void 0
-      });
-    }
-  }
-  const hasHumanComment = [reviewComments, issueComments].some(
-    (result) => result.status === "fulfilled" && result.value.some(
-      (comment) => comment.user?.type === "User"
-    )
-  ) || reviewItems.some(
-    (review) => review.user?.type === "User" && Boolean(review.body?.trim())
-  );
-  const groupId = issue ? issue.parent?.id ?? issue.project?.id ?? "unparented" : "unlinked";
-  const groupTitle = issue ? issue.parent?.title ?? issue.project?.name ?? "Unparented issues" : "";
-  const groupUrl = issue ? issue.parent?.url ?? issue.project?.url ?? "" : "";
-  return {
-    id: `${repo}#${number}`,
-    url: pullRequest.html_url,
-    repo,
-    number,
-    title: pullRequest.title,
-    draft: pullRequest.draft,
-    state: pullRequest.draft ? "draft" : "open",
-    createdAt: pullRequest.created_at,
-    issueId: issue?.id ?? "",
-    issueTitle: issue?.title,
-    issueUrl: issue?.url,
-    groupId,
-    groupTitle,
-    groupUrl,
-    checks,
-    reviewers: [...reviewerMap].map(([login, status2]) => ({ login, status: status2 })),
-    automerge: !!pullRequest.auto_merge,
-    mergeQueued: false,
-    conflicts: pullRequest.mergeable === false,
-    comments: hasHumanComment
-  };
-}
-async function markMergeQueued(token, prs) {
-  for (let start = 0; start < prs.length; start += 50) {
-    const batch = prs.slice(start, start + 50);
-    const byRepo = /* @__PURE__ */ new Map();
-    for (const pr of batch) {
-      const items = byRepo.get(pr.repo) ?? [];
-      items.push(pr);
-      byRepo.set(pr.repo, items);
-    }
-    const groups = [...byRepo];
-    const fields = groups.map(([repo, items], i) => {
-      const [owner, name] = repo.split("/");
-      const pulls = items.map((pr, j) => `p${j}:pullRequest(number:${pr.number}){mergeQueueEntry{id}}`).join(" ");
-      return `r${i}:repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){${pulls}}`;
-    }).join(" ");
-    const response = await requestJson(
-      "https://api.github.com/graphql",
-      "POST",
-      `Bearer ${token}`,
-      { query: `query{${fields}}` }
-    );
-    if (response.errors?.length) {
-      throw new Error(
-        `GitHub merge queue lookup: ${response.errors.map((e) => e.message).join("; ")}`
-      );
-    }
-    groups.forEach(
-      ([, items], i) => items.forEach((pr, j) => {
-        pr.mergeQueued = !!response.data?.[`r${i}`]?.[`p${j}`]?.mergeQueueEntry;
-      })
-    );
-  }
-}
-async function authoredOpenPrs(token) {
-  const viewer = await requestGitHub(token, "/user");
-  if (!viewer.login) {
-    throw new Error("Could not identify the GitHub API key owner.");
-  }
-  const prs = [];
-  for (let page = 1; page <= 10; page++) {
-    const autoMergeQuery = encodeURIComponent(`is:pr is:open author:${viewer.login}`);
-    const result = await requestGitHub(
-      token,
-      `/search/issues?q=${autoMergeQuery}&per_page=100&page=${page}`
-    );
-    if (result.incomplete_results) {
-      throw new Error("GitHub returned incomplete pull request search results.");
-    }
-    for (const item of result.items ?? []) {
-      const ref = parsePullRequestUrl(item.html_url);
-      if (ref) {
-        prs.push({ ...ref, url: item.html_url, draft: !!item.draft });
-      }
-    }
-    if ((result.items ?? []).length < 100) {
-      break;
-    }
-    if (page === 10) {
-      throw new Error("GitHub search exceeded its 1,000 pull request result limit.");
-    }
-  }
-  return prs;
-}
-async function launchPr(credentials, pr) {
-  let data = await requestGitHub(
-    credentials.githubKey,
-    `/repos/${pr.repo}/pulls/${pr.number}`
-  );
-  if (data.state !== "open") {
-    throw new Error(`Pull request is ${data.state}, not open.`);
-  }
-  const rebase = await rebasePullRequest(credentials.githubKey, pr.repo, data);
-  const branchUpdate = {
-    rebaseStatus: rebase.status,
-    warnings: rebase.warning ? [rebase.warning] : []
-  };
-  if (rebase.status === "updated") {
-    data = rebase.remote ?? data;
-    if (data.state !== "open") {
-      throw new Error(`Pull request became ${data.state} after rebasing.`);
-    }
-  }
-  if (data.draft) {
-    const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
-    const ready = await requestJson(
-      "https://api.github.com/graphql",
-      "POST",
-      `Bearer ${credentials.githubKey}`,
-      { query: readyQuery, variables: { id: data.node_id } }
-    );
-    if (ready.errors?.length) {
-      throw new Error(ready.errors.map((e) => e.message).join("; "));
-    }
-    if (ready.data?.markPullRequestReadyForReview?.pullRequest?.isDraft !== false) {
-      throw new Error("GitHub did not mark the pull request ready for review.");
-    }
-  }
-  if (data.auto_merge) {
-    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
-  }
-  const autoMergeQuery = `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}`;
-  try {
-    const result = await requestJson(
-      "https://api.github.com/graphql",
-      "POST",
-      `Bearer ${credentials.githubKey}`,
-      { query: autoMergeQuery, variables: { id: data.node_id } }
-    );
-    if (result.errors?.length) {
-      throw new Error(
-        result.errors.map((e) => e.message).join("; ")
-      );
-    }
-    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
-  } catch (e) {
-    return {
-      readyForReview: true,
-      automergeEnabled: false,
-      ...branchUpdate,
-      error: `Ready for review, but auto-merge could not be enabled: ${e instanceof Error ? e.message : String(e)}`
-    };
-  }
-}
-async function requestReviewer(credentials, pr, login) {
-  await requestGitHub(
-    credentials.githubKey,
-    `/repos/${pr.repo}/pulls/${pr.number}/requested_reviewers`,
-    "POST",
-    { reviewers: [login] }
-  );
-}
-async function closePr(credentials, pr) {
-  await requestGitHub(
-    credentials.githubKey,
-    `/repos/${pr.repo}/pulls/${pr.number}`,
-    "PATCH",
-    {
-      state: "closed"
-    }
-  );
+  return results;
 }
 
 // src/api/discovery.ts
-async function referencedLinearIssue(key, pr, cache) {
-  for (const id of referencedIdentifiers(pr)) {
-    if (!cache.has(id)) {
-      try {
-        const result = await queryLinear(
-          key,
-          `query($id:String!){issue(id:$id){${ISSUE_FIELDS}}}`,
-          { id }
-        );
-        cache.set(id, result.issue);
-      } catch (e) {
-        if (!String(e).includes("Entity not found: Issue")) {
-          throw e;
-        }
-        cache.set(id, null);
-      }
-    }
-    const issue = cache.get(id);
-    if (issue) {
-      return issue;
-    }
-  }
-  return null;
-}
 async function discover(credentials) {
-  const authoredOpen = await authoredOpenPrs(credentials.githubKey);
-  const roots = await assignedRoots(credentials.linearKey);
-  const seen = /* @__PURE__ */ new Set();
-  const issues = [];
-  const errors = [];
-  let frontier = roots;
-  while (frontier.length) {
-    const batch = frontier.filter((i) => {
-      if (seen.has(i.id)) {
-        return false;
-      }
-      seen.add(i.id);
-      return true;
-    });
-    issues.push(...batch);
-    const next = [];
-    await forEachConcurrent(batch, 6, async (issue) => {
-      try {
-        next.push(...await issueChildren(credentials.linearKey, issue.id));
-      } catch (e) {
-        errors.push(`${issue.identifier} children: ${String(e)}`);
-      }
-    });
-    frontier = next;
-  }
-  const linked = await discoverLinked(credentials, issues, []);
-  const prs = linked.prs;
-  errors.push(...linked.errors);
-  const associatedIds = new Set(prs.map((pr) => pr.id));
-  const authored = authoredOpen.filter(
-    (pr) => !associatedIds.has(`${pr.repo}#${pr.number}`)
-  );
-  const attached = await attachedPrUrls(
-    credentials.linearKey,
-    authored.map((pr) => pr.url)
-  );
-  const issueRefs = /* @__PURE__ */ new Map();
-  await forEachConcurrent(authored, 6, async (ref) => {
-    const pr = await requestGitHub(
-      credentials.githubKey,
-      `/repos/${ref.repo}/pulls/${ref.number}`
-    );
-    if (pr.state !== "open") {
-      return;
-    }
-    const issue = await referencedLinearIssue(credentials.linearKey, pr, issueRefs);
-    if (attached.has(ref.url) && !issue && !pr.draft) {
-      return;
-    }
-    const item = await fetchPullRequest(
-      credentials.githubKey,
-      ref.repo,
-      ref.number,
-      issue ?? void 0,
-      true,
-      pr
-    );
-    if (item) {
-      prs.push(item);
-    }
-  });
-  await markMergeQueued(credentials.githubKey, prs);
-  return { prs, errors };
-}
-async function discoverLinked(credentials, issues, knownRepos) {
-  const prs = [];
-  const used = /* @__PURE__ */ new Set();
-  const errors = [];
-  const refsByIssue = /* @__PURE__ */ new Map();
-  const allowedRepos = /* @__PURE__ */ new Set();
-  await forEachConcurrent(issues, 6, async (issue) => {
-    const refs = /* @__PURE__ */ new Map();
-    refsByIssue.set(issue.id, refs);
-    try {
-      for (const url of await attachmentUrls(credentials.linearKey, issue.id)) {
-        const ref = parsePullRequestUrl(url);
-        if (ref) {
-          allowedRepos.add(ref.repo);
-          refs.set(`${ref.repo}#${ref.number}`, { ...ref, attached: true });
-        }
-      }
-    } catch (e) {
-      errors.push(`${issue.identifier} attachments: ${String(e)}`);
-    }
-  });
-  for (const repo of knownRepos) {
-    allowedRepos.add(repo);
-  }
-  const issuesByIdentifier = new Map(
-    issues.map((issue) => [issue.identifier.toUpperCase(), issue])
-  );
-  await forEachConcurrent([...allowedRepos], 3, async (repo) => {
-    try {
-      for (const pull of await openRepoPulls(credentials.githubKey, repo)) {
-        const issue = referencedIdentifiers(pull).map((id) => issuesByIdentifier.get(id)).find((match) => !!match);
-        if (!issue) {
-          continue;
-        }
-        const refs = refsByIssue.get(issue.id);
-        const key = `${repo}#${pull.number}`;
-        if (!refs.has(key)) {
-          refs.set(key, { repo, number: pull.number, attached: false });
-        }
-      }
-    } catch (e) {
-      errors.push(`${repo} pull request list: ${String(e)}`);
-    }
-  });
-  await forEachConcurrent(issues, 6, async (issue) => {
-    const refs = refsByIssue.get(issue.id);
-    for (const ref of refs.values()) {
-      const key = `${ref.repo}#${ref.number}`;
-      if (used.has(key)) {
-        continue;
-      }
-      used.add(key);
-      try {
-        const pr = await fetchPullRequest(
-          credentials.githubKey,
-          ref.repo,
-          ref.number,
-          issue,
-          ref.attached
-        );
-        if (pr) {
-          prs.push(pr);
-        }
-      } catch (e) {
-        errors.push(`${key}: ${String(e)}`);
-      }
-    }
-  });
-  return { prs, errors };
-}
-async function discoverGroup(credentials, groupId, groupUrl, knownRepos, knownIssueIds) {
-  let issues;
-  if (groupUrl.includes("/project/")) {
-    issues = (await projectIssues(credentials.linearKey, groupId)).filter(
-      (issue) => !issue.parent
-    );
-  } else if (groupUrl.includes("/issue/")) {
-    issues = await issueChildren(credentials.linearKey, groupId);
-  } else {
-    issues = [];
-    await forEachConcurrent(knownIssueIds, 6, async (id) => {
-      const issue = await issueById(credentials.linearKey, id);
-      if (issue) {
-        issues.push(issue);
-      }
-    });
-  }
-  const result = await discoverLinked(credentials, issues, knownRepos);
-  result.prs = result.prs.filter((pr) => pr.groupId === groupId);
-  await markMergeQueued(credentials.githubKey, result.prs);
-  return result;
+  const snapshots = await fetchAuthoredSnapshots(credentials.githubKey);
+  const prs = await resolveLinearContexts(credentials.linearKey, snapshots);
+  return { prs, errors: [] };
 }
 async function refreshPrs(credentials, previous) {
   const snapshots = await fetchSnapshots(credentials.githubKey, previous);
@@ -986,7 +550,7 @@ async function refreshPrs(credentials, previous) {
 // src/metadata.ts
 var BOARD_VIEW_TYPE = "linear-prs";
 var METADATA_PATH = ".linear-prs/metadata.json";
-var STAGES = ["A", "B", "C"];
+var STAGES = ["A", "B", "C", "D"];
 var DEFAULT_SETTINGS = {
   linearKey: "",
   githubKey: "",
@@ -1186,6 +750,88 @@ ${pending.map((c) => c.name).join("\n")}` : pullRequest.checks.length ? "All che
 
 // src/ui/board-view.ts
 var import_obsidian5 = require("obsidian");
+
+// src/api/github.ts
+async function launchPr(credentials, pr, prefetched) {
+  let data = prefetched ?? await requestGitHub(
+    credentials.githubKey,
+    `/repos/${pr.repo}/pulls/${pr.number}`
+  );
+  if (data.state !== "open") {
+    throw new Error(`Pull request is ${data.state}, not open.`);
+  }
+  const rebase = await rebasePullRequest(credentials.githubKey, pr.repo, data);
+  const branchUpdate = {
+    rebaseStatus: rebase.status,
+    warnings: rebase.warning ? [rebase.warning] : []
+  };
+  if (rebase.status === "updated") {
+    data = rebase.remote ?? data;
+    if (data.state !== "open") {
+      throw new Error(`Pull request became ${data.state} after rebasing.`);
+    }
+  }
+  if (data.draft) {
+    const readyQuery = `mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}`;
+    const ready = await requestJson(
+      "https://api.github.com/graphql",
+      "POST",
+      `Bearer ${credentials.githubKey}`,
+      { query: readyQuery, variables: { id: data.node_id } }
+    );
+    if (ready.errors?.length) {
+      throw new Error(ready.errors.map((e) => e.message).join("; "));
+    }
+    if (ready.data?.markPullRequestReadyForReview?.pullRequest?.isDraft !== false) {
+      throw new Error("GitHub did not mark the pull request ready for review.");
+    }
+  }
+  if (data.auto_merge) {
+    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
+  }
+  const autoMergeQuery = `mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}`;
+  try {
+    const result = await requestJson(
+      "https://api.github.com/graphql",
+      "POST",
+      `Bearer ${credentials.githubKey}`,
+      { query: autoMergeQuery, variables: { id: data.node_id } }
+    );
+    if (result.errors?.length) {
+      throw new Error(
+        result.errors.map((e) => e.message).join("; ")
+      );
+    }
+    return { readyForReview: true, automergeEnabled: true, ...branchUpdate };
+  } catch (e) {
+    return {
+      readyForReview: true,
+      automergeEnabled: false,
+      ...branchUpdate,
+      error: `Ready for review, but auto-merge could not be enabled: ${e instanceof Error ? e.message : String(e)}`
+    };
+  }
+}
+async function requestReviewer(credentials, pr, login) {
+  await requestGitHub(
+    credentials.githubKey,
+    `/repos/${pr.repo}/pulls/${pr.number}/requested_reviewers`,
+    "POST",
+    { reviewers: [login] }
+  );
+}
+async function closePr(credentials, pr) {
+  await requestGitHub(
+    credentials.githubKey,
+    `/repos/${pr.repo}/pulls/${pr.number}`,
+    "PATCH",
+    {
+      state: "closed"
+    }
+  );
+}
+
+// src/ui/board-view.ts
 var BoardView = class extends import_obsidian5.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -1257,14 +903,14 @@ var BoardView = class extends import_obsidian5.ItemView {
       this.render();
     }
   }
-  async refreshGroup(id, url, title) {
+  async refreshGroup(id, title) {
     if (this.busy || this.refreshingGroups.size) {
       return;
     }
     this.refreshingGroups.add(id);
     this.render();
     try {
-      const r = await this.plugin.refreshGroup(id, url);
+      const r = await this.plugin.refreshGroup(id);
       new import_obsidian5.Notice(`${title}: refreshed ${r.prs.length} PRs`);
     } catch (e) {
       new import_obsidian5.Notice(errorMessage(e), 8e3);
@@ -1294,16 +940,16 @@ var BoardView = class extends import_obsidian5.ItemView {
       this.render();
     }
   }
-  rememberCollapse(fetchPullRequest2, id) {
+  rememberCollapse(fetchPullRequest, id) {
     const metadata = this.plugin.metadata;
-    fetchPullRequest2.open = !metadata.collapsed.includes(id);
-    let lastOpen = fetchPullRequest2.open;
-    fetchPullRequest2.ontoggle = () => {
-      if (!fetchPullRequest2.isConnected || fetchPullRequest2.open === lastOpen) {
+    fetchPullRequest.open = !metadata.collapsed.includes(id);
+    let lastOpen = fetchPullRequest.open;
+    fetchPullRequest.ontoggle = () => {
+      if (!fetchPullRequest.isConnected || fetchPullRequest.open === lastOpen) {
         return;
       }
-      lastOpen = fetchPullRequest2.open;
-      metadata.collapsed = fetchPullRequest2.open ? metadata.collapsed.filter((x) => x !== id) : [.../* @__PURE__ */ new Set([...metadata.collapsed, id])];
+      lastOpen = fetchPullRequest.open;
+      metadata.collapsed = fetchPullRequest.open ? metadata.collapsed.filter((x) => x !== id) : [.../* @__PURE__ */ new Set([...metadata.collapsed, id])];
       void this.plugin.saveMetadata();
     };
   }
@@ -1327,9 +973,9 @@ var BoardView = class extends import_obsidian5.ItemView {
     ).sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   }
   renderStagingSection(pullRequests, title, type, parent) {
-    const fetchPullRequest2 = parent.createEl("details", { cls: "linear-prs-group" });
-    this.rememberCollapse(fetchPullRequest2, `queue:${type}`);
-    const summary = fetchPullRequest2.createEl("summary", {
+    const fetchPullRequest = parent.createEl("details", { cls: "linear-prs-group" });
+    this.rememberCollapse(fetchPullRequest, `queue:${type}`);
+    const summary = fetchPullRequest.createEl("summary", {
       cls: "linear-prs-group-header"
     });
     createIcon(summary, "chevron-down", void 0, "linear-prs-chevron");
@@ -1362,7 +1008,7 @@ var BoardView = class extends import_obsidian5.ItemView {
         loading: this.isLaunching(pullRequests) ? "pulse" : void 0
       }
     );
-    const list = fetchPullRequest2.createDiv({ cls: "linear-prs-list" });
+    const list = fetchPullRequest.createDiv({ cls: "linear-prs-list" });
     if (!pullRequests.length) {
       list.createDiv({ text: `No pull requests in ${title}`, cls: "linear-prs-empty" });
     } else {
@@ -1405,9 +1051,24 @@ var BoardView = class extends import_obsidian5.ItemView {
     let rebasesCompleted = 0;
     const errors = [];
     try {
+      const snapshots = await fetchSnapshots(
+        this.plugin.credentials().githubKey,
+        pullRequests
+      );
+      const current = new Map(
+        snapshots.filter((snapshot) => snapshot.pullRequest).map((snapshot) => [snapshot.pullRequest.id, snapshot])
+      );
       await forEachConcurrent(pullRequests, 3, async (pullRequest) => {
         try {
-          const result = await launchPr(this.plugin.credentials(), pullRequest);
+          const snapshot = current.get(pullRequest.id);
+          if (!snapshot?.pullRequest) {
+            throw new Error("Pull request is no longer open.");
+          }
+          const result = await launchPr(
+            this.plugin.credentials(),
+            pullRequest,
+            snapshot.remote
+          );
           if (result.rebaseStatus === "updated") {
             rebasesCompleted++;
           }
@@ -1603,9 +1264,9 @@ var BoardView = class extends import_obsidian5.ItemView {
     });
   }
   renderGroup(pullRequests, id, title, url, parent) {
-    const fetchPullRequest2 = parent.createEl("details", { cls: "linear-prs-group" });
-    this.rememberCollapse(fetchPullRequest2, id);
-    const summary = fetchPullRequest2.createEl("summary", {
+    const fetchPullRequest = parent.createEl("details", { cls: "linear-prs-group" });
+    this.rememberCollapse(fetchPullRequest, id);
+    const summary = fetchPullRequest.createEl("summary", {
       cls: "linear-prs-group-header"
     });
     createIcon(summary, "chevron-down", void 0, "linear-prs-chevron");
@@ -1626,7 +1287,7 @@ var BoardView = class extends import_obsidian5.ItemView {
       actions,
       `Refresh ${title}`,
       "refresh-cw",
-      () => void this.refreshGroup(id, url, title),
+      () => void this.refreshGroup(id, title),
       { loading: this.refreshingGroups.has(id) ? "spin" : void 0 }
     );
     if (this.busy || this.refreshingGroups.size && !this.refreshingGroups.has(id)) {
@@ -1669,7 +1330,7 @@ var BoardView = class extends import_obsidian5.ItemView {
         select.value = "";
       };
     }
-    const list = fetchPullRequest2.createDiv({ cls: "linear-prs-list" });
+    const list = fetchPullRequest.createDiv({ cls: "linear-prs-list" });
     pullRequests.forEach((pullRequest) => this.renderPullRequest(pullRequest, list));
   }
   render() {
@@ -1891,13 +1552,22 @@ var LinearPrsPlugin = class extends import_obsidian6.Plugin {
     if (!stale.length) {
       return false;
     }
-    await withDeadline(
-      markMergeQueued(this.settings.githubKey, stale),
+    const refreshed = await withDeadline(
+      fetchSnapshots(this.settings.githubKey, stale),
       3e4,
       "Merge queue lookup"
     );
     if (this.metadata.pullRequests !== snapshot) {
       return false;
+    }
+    const statuses = new Map(
+      refreshed.map((result) => [
+        result.pullRequest?.id,
+        result.pullRequest?.mergeQueued
+      ])
+    );
+    for (const pullRequest of stale) {
+      pullRequest.mergeQueued = statuses.get(pullRequest.id) ?? false;
     }
     await this.saveMetadata();
     return true;
@@ -1919,29 +1589,19 @@ var LinearPrsPlugin = class extends import_obsidian6.Plugin {
     await this.saveMetadata();
     return result;
   }
-  async refreshGroup(groupId, groupUrl) {
+  async refreshGroup(groupId) {
     if (!this.settings.linearKey || !this.settings.githubKey) {
       throw new Error("Enter both API keys in Linear PRs settings.");
     }
     const previous = this.metadata.pullRequests.filter(
       (pullRequest) => pullRequest.groupId === groupId
     );
-    const result = await withDeadline(
-      discoverGroup(
-        this.settings,
-        groupId,
-        groupUrl,
-        [...new Set(previous.map((pullRequest) => pullRequest.repo))],
-        [...new Set(previous.map((pullRequest) => pullRequest.issueId).filter(Boolean))]
-      ),
+    const prs = await withDeadline(
+      refreshPrs(this.credentials(), previous),
       3e4,
       "Group refresh"
     );
-    if (result.errors.length) {
-      throw new Error(
-        `Group refresh failed: ${result.errors[0]}${result.errors.length > 1 ? ` (${result.errors.length} errors total)` : ""}`
-      );
-    }
+    const result = { prs, errors: [] };
     const updated = new Set(result.prs.map((pullRequest) => pullRequest.id));
     this.metadata.pullRequests = [
       ...result.prs,

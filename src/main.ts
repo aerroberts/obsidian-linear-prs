@@ -1,8 +1,7 @@
 import { fetchSnapshots } from './api/snapshots';
 import { rebasePullRequest } from './api/rebase';
 import { Plugin, Notice } from 'obsidian';
-import { discover, discoverGroup, refreshPrs } from './api/discovery';
-import { markMergeQueued } from './api/github';
+import { discover, refreshPrs } from './api/discovery';
 import type { PullRequest } from './types';
 import {
   BOARD_VIEW_TYPE,
@@ -72,13 +71,22 @@ export default class LinearPrsPlugin extends Plugin {
     if (!stale.length) {
       return false;
     }
-    await withDeadline(
-      markMergeQueued(this.settings.githubKey, stale),
+    const refreshed = await withDeadline(
+      fetchSnapshots(this.settings.githubKey, stale),
       30000,
       'Merge queue lookup',
     );
     if (this.metadata.pullRequests !== snapshot) {
       return false;
+    }
+    const statuses = new Map(
+      refreshed.map((result) => [
+        result.pullRequest?.id,
+        result.pullRequest?.mergeQueued,
+      ]),
+    );
+    for (const pullRequest of stale) {
+      pullRequest.mergeQueued = statuses.get(pullRequest.id) ?? false;
     }
     await this.saveMetadata();
     return true;
@@ -102,29 +110,19 @@ export default class LinearPrsPlugin extends Plugin {
     await this.saveMetadata();
     return result;
   }
-  async refreshGroup(groupId: string, groupUrl: string) {
+  async refreshGroup(groupId: string) {
     if (!this.settings.linearKey || !this.settings.githubKey) {
       throw new Error('Enter both API keys in Linear PRs settings.');
     }
     const previous = this.metadata.pullRequests.filter(
       (pullRequest) => pullRequest.groupId === groupId,
     );
-    const result = await withDeadline(
-      discoverGroup(
-        this.settings,
-        groupId,
-        groupUrl,
-        [...new Set(previous.map((pullRequest) => pullRequest.repo))],
-        [...new Set(previous.map((pullRequest) => pullRequest.issueId).filter(Boolean))],
-      ),
+    const prs = await withDeadline(
+      refreshPrs(this.credentials(), previous),
       30000,
       'Group refresh',
     );
-    if (result.errors.length) {
-      throw new Error(
-        `Group refresh failed: ${result.errors[0]}${result.errors.length > 1 ? ` (${result.errors.length} errors total)` : ''}`,
-      );
-    }
+    const result = { prs, errors: [] as string[] };
     const updated = new Set(result.prs.map((pullRequest) => pullRequest.id));
     this.metadata.pullRequests = [
       ...result.prs,

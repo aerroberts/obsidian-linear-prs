@@ -23,7 +23,11 @@ export async function resolveLinearContexts(
     const identifiers = [
       ...new Set(batch.flatMap((snapshot) => referencedIdentifiers(snapshot.remote))),
     ];
-    const filters = identifiers.map((identifier) => {
+    const validIdentifiers = identifiers.filter((identifier) => {
+      const number = Number(identifier.slice(identifier.lastIndexOf('-') + 1));
+      return Number.isSafeInteger(number) && number > 0 && number <= 2147483647;
+    });
+    const filters = validIdentifiers.map((identifier) => {
       const split = identifier.lastIndexOf('-');
       return {
         and: [

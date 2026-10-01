@@ -12,6 +12,8 @@ The keys are stored in Obsidian plugin settings at `.obsidian/plugins/obsidian-l
 
 ## Discovery and actions
 
+The board refreshes when opened, when revisited after a minute, and once per minute while active. Automatic refreshes pause during row/group actions and shipping.
+
 A full refresh uses one GitHub GraphQL search operation to read your open PRs and their status, then batches Linear `attachmentsForURL` lookups with the full issue and parent/project context. Attachments take precedence over identifiers in PR titles, bodies, and branches; identifiers provide a fallback when there is no attachment. Issues outside your assigned tree and archived issues can still provide context. Multiple attached issues are retained, with a deterministic primary issue for grouping. PRs with no match stay visible in the unlinked section.
 
 Existing group refresh reads the group's cached PR identities in one GitHub GraphQL query and retains their Linear context. Full refresh discovers new PRs and recomputes associations. Shipping also reads its group in one query, reuses those snapshots for actions, and reads the resulting status in one query afterward. Rebase comparisons, guarded writes, and asynchronous verification are separate API operations. GraphQL connections use cursor pagination only when needed; account search and scoped reads use pages of up to 100 PRs. Failed or truncated reads retain the cached board instead of silently marking PRs unlinked. Check summaries are included; individual check annotations are omitted from bulk reads to stay within GitHub's resource limits.

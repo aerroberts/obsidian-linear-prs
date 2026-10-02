@@ -564,6 +564,7 @@ var createEmptyMetadata = () => ({
   version: 1,
   reviewTypes: {},
   reviewMessage: [],
+  searchHistory: [],
   collapsed: [],
   selectedRepo: "",
   hidden: [],
@@ -699,6 +700,38 @@ var Preferences = class extends import_obsidian3.PluginSettingTab {
     });
   }
 };
+
+// src/linear-issue-links.ts
+function linearIssueLinks(pullRequest) {
+  const issues = pullRequest.linearContext?.issues;
+  if (issues?.length) {
+    return [
+      ...new Map(
+        issues.map((issue) => [
+          issue.identifier,
+          { identifier: issue.identifier, title: issue.title, url: issue.url }
+        ])
+      ).values()
+    ];
+  }
+  const identifier = pullRequest.issueUrl?.match(
+    /\/issue\/([A-Z][A-Z0-9]*-\d+)(?:\/|$)/i
+  )?.[1];
+  return identifier && pullRequest.issueUrl ? [
+    {
+      identifier: identifier.toUpperCase(),
+      title: pullRequest.issueTitle ?? identifier,
+      url: pullRequest.issueUrl
+    }
+  ] : [];
+}
+function rememberSearch(history, query) {
+  const term = query.trim();
+  return term ? [
+    term,
+    ...history.filter((entry) => entry.toLowerCase() !== term.toLowerCase())
+  ].slice(0, 10) : history;
+}
 
 // src/ui/pull-request-badges.ts
 var import_obsidian4 = require("obsidian");
@@ -841,6 +874,7 @@ var BoardView = class extends import_obsidian5.ItemView {
     super(leaf);
     this.plugin = plugin;
   }
+  searchHistoryId = Math.random().toString(36).slice(2);
   busy = false;
   archived = false;
   search = "";
@@ -961,6 +995,10 @@ var BoardView = class extends import_obsidian5.ItemView {
         pullRequest.repo,
         String(pullRequest.number),
         pullRequest.id,
+        ...linearIssueLinks(pullRequest).flatMap((issue) => [
+          issue.identifier,
+          issue.title
+        ]),
         pullRequest.issueTitle,
         pullRequest.issueUrl,
         pullRequest.groupTitle
@@ -1240,14 +1278,14 @@ var BoardView = class extends import_obsidian5.ItemView {
   renderPullRequestMetadata(pullRequest, row) {
     const meta = row.createDiv({ cls: "linear-prs-meta" });
     const refs = meta.createSpan({ cls: "linear-prs-meta-link" });
-    if (pullRequest.issueTitle && pullRequest.issueUrl) {
-      const issue = refs.createEl("a", {
-        text: pullRequest.issueTitle,
-        href: pullRequest.issueUrl,
-        cls: "linear-prs-issue-title"
+    for (const issue of linearIssueLinks(pullRequest)) {
+      const pill = refs.createEl("a", {
+        text: issue.identifier,
+        href: issue.url,
+        cls: "linear-prs-pill linear-prs-issue-id"
       });
-      issue.setAttr("target", "_blank");
-      issue.setAttr("title", pullRequest.issueTitle);
+      pill.setAttr("target", "_blank");
+      pill.setAttr("title", `${issue.identifier}: ${issue.title}`);
     }
     const a = refs.createEl("a", { href: pullRequest.url, cls: "linear-prs-meta-link" });
     a.setAttr("target", "_blank");
@@ -1395,6 +1433,12 @@ var BoardView = class extends import_obsidian5.ItemView {
         title: `Search pull requests (${shortcutLabel})`
       }
     });
+    const historyId = `linear-prs-search-history-${this.searchHistoryId}`;
+    search.setAttr("list", historyId);
+    const history = right.createEl("datalist", { attr: { id: historyId } });
+    for (const query of metadata.searchHistory) {
+      history.createEl("option", { value: query });
+    }
     search.value = this.search;
     this.searchInput = search;
     search.oninput = () => {
@@ -1405,6 +1449,14 @@ var BoardView = class extends import_obsidian5.ItemView {
       this.searchInput?.setSelectionRange(start, start);
     };
     search.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        metadata.searchHistory = rememberSearch(metadata.searchHistory, search.value);
+        void this.plugin.saveMetadata();
+        history.empty();
+        for (const query of metadata.searchHistory) {
+          history.createEl("option", { value: query });
+        }
+      }
       if (event.key === "Escape" && search.value) {
         event.stopPropagation();
         this.search = "";

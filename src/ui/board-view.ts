@@ -1,3 +1,4 @@
+import { linearIssueLinks, rememberSearch } from '../linear-issue-links';
 import { fetchSnapshots } from '../api/snapshots';
 import { forEachConcurrent } from '../async';
 import { renderPullRequestBadges } from './pull-request-badges';
@@ -15,6 +16,7 @@ import {
   errorMessage,
 } from './elements';
 export class BoardView extends ItemView {
+  private searchHistoryId = Math.random().toString(36).slice(2);
   private busy = false;
   private archived = false;
   private search = '';
@@ -160,6 +162,10 @@ export class BoardView extends ItemView {
             pullRequest.repo,
             String(pullRequest.number),
             pullRequest.id,
+            ...linearIssueLinks(pullRequest).flatMap((issue) => [
+              issue.identifier,
+              issue.title,
+            ]),
             pullRequest.issueTitle,
             pullRequest.issueUrl,
             pullRequest.groupTitle,
@@ -476,14 +482,14 @@ export class BoardView extends ItemView {
   private renderPullRequestMetadata(pullRequest: PullRequest, row: HTMLElement): void {
     const meta = row.createDiv({ cls: 'linear-prs-meta' });
     const refs = meta.createSpan({ cls: 'linear-prs-meta-link' });
-    if (pullRequest.issueTitle && pullRequest.issueUrl) {
-      const issue = refs.createEl('a', {
-        text: pullRequest.issueTitle,
-        href: pullRequest.issueUrl,
-        cls: 'linear-prs-issue-title',
+    for (const issue of linearIssueLinks(pullRequest)) {
+      const pill = refs.createEl('a', {
+        text: issue.identifier,
+        href: issue.url,
+        cls: 'linear-prs-pill linear-prs-issue-id',
       });
-      issue.setAttr('target', '_blank');
-      issue.setAttr('title', pullRequest.issueTitle);
+      pill.setAttr('target', '_blank');
+      pill.setAttr('title', `${issue.identifier}: ${issue.title}`);
     }
     const a = refs.createEl('a', { href: pullRequest.url, cls: 'linear-prs-meta-link' });
     a.setAttr('target', '_blank');
@@ -643,6 +649,12 @@ export class BoardView extends ItemView {
         title: `Search pull requests (${shortcutLabel})`,
       },
     });
+    const historyId = `linear-prs-search-history-${this.searchHistoryId}`;
+    search.setAttr('list', historyId);
+    const history = right.createEl('datalist', { attr: { id: historyId } });
+    for (const query of metadata.searchHistory) {
+      history.createEl('option', { value: query });
+    }
     search.value = this.search;
     this.searchInput = search;
     search.oninput = () => {
@@ -653,6 +665,14 @@ export class BoardView extends ItemView {
       this.searchInput?.setSelectionRange(start, start);
     };
     search.onkeydown = (event) => {
+      if (event.key === 'Enter') {
+        metadata.searchHistory = rememberSearch(metadata.searchHistory, search.value);
+        void this.plugin.saveMetadata();
+        history.empty();
+        for (const query of metadata.searchHistory) {
+          history.createEl('option', { value: query });
+        }
+      }
       if (event.key === 'Escape' && search.value) {
         event.stopPropagation();
         this.search = '';

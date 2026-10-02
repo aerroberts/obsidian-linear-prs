@@ -458,3 +458,8 @@
     animation: none;
   }
 }
+
+.linear-prs-issue-id {
+  color: var(--text-accent);
+  text-decoration: none;
+}

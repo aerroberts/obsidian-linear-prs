@@ -1,3 +1,4 @@
+import { linearIssueLinks, rememberSearch } from '../src/linear-issue-links';
 import {
   fetchSnapshots,
   fetchAuthoredSnapshots,
@@ -753,4 +754,45 @@ test('zero and out-of-range incidental identifiers cannot break attachment resol
     },
   ]);
   assert.equal(pr.issueId, 'issue');
+});
+
+test('Linear ID pills support cached URLs and all associated issues', () => {
+  const previous = createPullRequestReference({ repo: 'owner/repo', number: 42 });
+  assert.deepEqual(
+    linearIssueLinks({
+      ...previous,
+      issueUrl: linkedIssue.url,
+      issueTitle: linkedIssue.title,
+    }),
+    [{ identifier: 'ENG-4777', title: linkedIssue.title, url: linkedIssue.url }],
+  );
+  assert.equal(
+    linearIssueLinks({
+      ...previous,
+      linearContext: {
+        source: 'attachment',
+        issues: [linkedIssue, linkedIssue, { ...linkedIssue, identifier: 'ENG-4781' }],
+      },
+    }).length,
+    2,
+  );
+  assert.deepEqual(linearIssueLinks(previous), []);
+});
+
+test('search history persists completed terms with a bounded, case-insensitive recency order', () => {
+  assert.deepEqual(rememberSearch(['ENG-4777', 'other'], ' eng-4777 '), [
+    'eng-4777',
+    'other',
+  ]);
+  assert.equal(
+    rememberSearch(
+      Array.from({ length: 10 }, (_, i) => String(i)),
+      'ENG-4781',
+    ).length,
+    10,
+  );
+  assert.deepEqual(migrateMetadata({ searchHistory: ['ENG-4781'] }).searchHistory, [
+    'ENG-4781',
+  ]);
+  assert.deepEqual(migrateMetadata({}).searchHistory, []);
 });

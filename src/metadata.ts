@@ -1,3 +1,4 @@
+import type { MergeDay } from './merge-activity';
 import type { PullRequest } from './types';
 export const BOARD_VIEW_TYPE = 'linear-prs';
 export const METADATA_PATH = '.linear-prs/metadata.json';
@@ -9,6 +10,7 @@ export type Metadata = {
   reviewTypes: Record<string, StagingAssignment>;
   reviewMessage: string[];
   searchHistory: string[];
+  mergeActivity: MergeDay[] | null;
   collapsed: string[];
   selectedRepo: string;
   hidden: string[];
@@ -30,6 +32,7 @@ export const createEmptyMetadata = (): Metadata => ({
   reviewTypes: {},
   reviewMessage: [],
   searchHistory: [],
+  mergeActivity: null,
   collapsed: [],
   selectedRepo: '',
   hidden: [],

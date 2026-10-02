@@ -31,3 +31,5 @@ Launch uses GitHub’s branch update API with the rebase method. It compares aga
 Each PR row groups controls as trash, refresh, and copy; staging A/B/C/D; then status badges. The row refresh fetches only that PR’s latest GitHub state, attempts a rebase when needed, and reloads its checks and status afterward. It preserves draft state, auto-merge settings, and local staging assignments.
 
 Linked Linear issues appear beneath each PR as ID pills (for example, ENG-4781), with the issue title in the tooltip. Search matches all linked issue IDs. Press Enter to save a search; the ten most recent searches are offered as suggestions and persist in vault metadata.
+
+The compact toolbar chart shows your authored PR merges by local day over the last 14 days, across all repositories. Hover a bar for its date and count. Full refresh reads merge activity alongside open PRs in the same GitHub operation; reopening the view uses the saved chart.

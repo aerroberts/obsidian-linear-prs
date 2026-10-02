@@ -1,3 +1,4 @@
+import { dailyMerges } from './merge-activity';
 import { fetchSnapshots } from './api/snapshots';
 import { rebasePullRequest } from './api/rebase';
 import { Plugin, Notice } from 'obsidian';
@@ -77,6 +78,7 @@ export default class LinearPrsPlugin extends Plugin {
           ),
       ),
     ];
+    this.metadata.mergeActivity = dailyMerges(result.mergedDates);
     this.metadata.lastRefresh = new Date().toISOString();
     await this.saveMetadata();
     return result;

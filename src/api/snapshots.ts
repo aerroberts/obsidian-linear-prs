@@ -1,3 +1,4 @@
+import { mergeWindow } from '../merge-activity';
 import type { PullRequest } from '../types';
 import type { GitHubPullRequest, GraphqlResponse } from './responses';
 import { requestJson } from './transport';
@@ -151,16 +152,41 @@ export async function fetchSnapshots(
 /** One account-wide read operation, with cursor pages only when GitHub requires them. */
 export async function fetchAuthoredSnapshots(
   token: string,
+  options: { onMergedDates?: (dates: string[]) => void } = {},
 ): Promise<PullRequestSnapshot[]> {
   const snapshots: PullRequestSnapshot[] = [];
   let after: string | null = null;
   do {
-    const result: { search: Connection<Snapshot> & { issueCount: number } } =
-      await graphql(
-        token,
-        `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}}}`,
-        { after },
-      );
+    const includeMerges: boolean = !!options.onMergedDates && after === null;
+    const mergeQuery = `is:pr is:merged author:@me merged:>=${mergeWindow().toISOString().slice(0, 10)}`;
+    const result: {
+      search: Connection<Snapshot> & { issueCount: number };
+      merged?: Connection<{ mergedAt: string }> & { issueCount: number };
+    } = await graphql(
+      token,
+      `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}} ${includeMerges ? `merged:search(query:${JSON.stringify(mergeQuery)},type:ISSUE,first:100){issueCount nodes{... on PullRequest{mergedAt}} ${PAGE}}` : ''}}`,
+      { after },
+    );
+    if (includeMerges) {
+      if (!result.merged || result.merged.issueCount > 1000) {
+        throw new Error('GitHub did not return complete merge activity.');
+      }
+      const dates = result.merged.nodes.map((pr) => pr.mergedAt);
+      let page = result.merged.pageInfo;
+      while (page.hasNextPage) {
+        if (!page.endCursor) {
+          throw new Error('Missing merge activity cursor.');
+        }
+        const next = await graphql<{ merged: Connection<{ mergedAt: string }> }>(
+          token,
+          `query($after:String!){merged:search(query:${JSON.stringify(mergeQuery)},type:ISSUE,first:100,after:$after){nodes{... on PullRequest{mergedAt}} ${PAGE}}}`,
+          { after: page.endCursor },
+        );
+        dates.push(...next.merged.nodes.map((pr) => pr.mergedAt));
+        page = next.merged.pageInfo;
+      }
+      options.onMergedDates?.(dates);
+    }
     if (result.search.issueCount > 1000) {
       throw new Error(
         'GitHub search exceeds its 1,000-result limit; cached board was retained.',

@@ -836,7 +836,7 @@ async function closePr(credentials, pr) {
 }
 
 // src/ui/board-view.ts
-var BoardView = class _BoardView extends import_obsidian5.ItemView {
+var BoardView = class extends import_obsidian5.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
@@ -863,23 +863,6 @@ var BoardView = class _BoardView extends import_obsidian5.ItemView {
       this.focusSearch();
     });
     this.render();
-    this.registerInterval(
-      window.setInterval(() => {
-        if (this.app.workspace.getActiveViewOfType(_BoardView) === this) {
-          void this.refresh({ quiet: true });
-        }
-      }, 6e4)
-    );
-    this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => {
-        if (this.app.workspace.getActiveViewOfType(_BoardView) === this && Date.now() - Date.parse(this.plugin.metadata.lastRefresh || "1970-01-01") >= 6e4) {
-          void this.refresh({ quiet: true });
-        }
-      })
-    );
-    if (this.plugin.settings.linearKey && this.plugin.settings.githubKey) {
-      void this.refresh({ quiet: true });
-    }
   }
   focusSearch() {
     this.searchInput?.focus();
@@ -894,7 +877,7 @@ var BoardView = class _BoardView extends import_obsidian5.ItemView {
       new import_obsidian5.Notice(errorMessage(e), 8e3);
     }
   }
-  async refresh(options = {}) {
+  async refresh() {
     if (this.busy || this.refreshingGroups.size || this.launching.size || !this.plugin.settings.linearKey || !this.plugin.settings.githubKey) {
       return;
     }
@@ -902,11 +885,9 @@ var BoardView = class _BoardView extends import_obsidian5.ItemView {
     this.render();
     try {
       const r = await this.plugin.refresh();
-      if (!options.quiet) {
-        new import_obsidian5.Notice(
-          `Linear PRs: ${r.prs.length} open PRs${r.errors.length ? `, ${r.errors.length} lookup errors` : ""}`
-        );
-      }
+      new import_obsidian5.Notice(
+        `Linear PRs: ${r.prs.length} open PRs${r.errors.length ? `, ${r.errors.length} lookup errors` : ""}`
+      );
       if (r.errors.length) {
         console.warn("Linear PR lookup errors", r.errors);
       }

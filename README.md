@@ -12,7 +12,7 @@ The keys are stored in Obsidian plugin settings at `.obsidian/plugins/obsidian-l
 
 ## Discovery and actions
 
-The board refreshes when opened, when revisited after a minute, and once per minute while active. Automatic refreshes pause during row/group actions and shipping.
+Opening or reloading the board displays saved data without network requests. Refresh runs only through explicit toolbar, group, or row controls; shipping refreshes status as part of that action.
 
 A full refresh uses one GitHub GraphQL search operation to read your open PRs and their status, then batches Linear `attachmentsForURL` lookups with the full issue and parent/project context. Attachments take precedence over identifiers in PR titles, bodies, and branches; identifiers provide a fallback when there is no attachment. Issues outside your assigned tree and archived issues can still provide context. Multiple attached issues are retained, with a deterministic primary issue for grouping. PRs with no match stay visible in the unlinked section.
 

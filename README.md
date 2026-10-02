@@ -29,3 +29,5 @@ Read the [code style](docs/CODE_STYLE.md), [architecture](docs/ARCHITECTURE.md),
 Launch uses GitHub’s branch update API with the rebase method. It compares against the current base branch and verifies that the PR’s head changes and is no longer behind before reporting a completed rebase. Branches already up to date are skipped. Conflicts, permissions, or uncompleted rebases appear in a persistent launch notice while the remaining launch actions continue. A failed rebase is excluded from the successful launch count.
 
 Each PR row groups controls as trash, refresh, and copy; staging A/B/C/D; then status badges. The row refresh fetches only that PR’s latest GitHub state, attempts a rebase when needed, and reloads its checks and status afterward. It preserves draft state, auto-merge settings, and local staging assignments.
+
+Linked Linear issues appear beneath each PR as ID pills (for example, ENG-4781), with the issue title in the tooltip. Search matches all linked issue IDs. Press Enter to save a search; the ten most recent searches are offered as suggestions and persist in vault metadata.

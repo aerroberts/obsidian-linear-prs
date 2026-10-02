@@ -8,6 +8,7 @@ export type Metadata = {
   version: 1;
   reviewTypes: Record<string, StagingAssignment>;
   reviewMessage: string[];
+  searchHistory: string[];
   collapsed: string[];
   selectedRepo: string;
   hidden: string[];
@@ -28,6 +29,7 @@ export const createEmptyMetadata = (): Metadata => ({
   version: 1,
   reviewTypes: {},
   reviewMessage: [],
+  searchHistory: [],
   collapsed: [],
   selectedRepo: '',
   hidden: [],

@@ -152,10 +152,6 @@ export class BoardView extends ItemView {
       )
       .filter(
         (pullRequest) =>
-          !metadata.selectedRepo || pullRequest.repo === metadata.selectedRepo,
-      )
-      .filter(
-        (pullRequest) =>
           !query ||
           [
             pullRequest.title,
@@ -621,24 +617,37 @@ export class BoardView extends ItemView {
     const metadata = this.plugin.metadata;
     const header = shell.createDiv({ cls: 'linear-prs-header' });
     const right = header.createSpan({ cls: 'linear-prs-toolbar' });
-    const repos = [
-      ...new Set(metadata.pullRequests.map((pullRequest) => pullRequest.repo)),
-    ].sort();
-    if (repos.length) {
-      const filter = right.createSpan({ cls: 'linear-prs-repository-filter' });
-      createIcon(filter, 'folder-git-2');
-      const sel = filter.createEl('select', {
-        attr: { 'aria-label': 'Filter repository' },
-      });
-      sel.createEl('option', { text: 'All repositories', value: '' });
-      repos.forEach((r) => sel.createEl('option', { text: r, value: r }));
-      sel.value = metadata.selectedRepo;
-      sel.onchange = () => {
-        metadata.selectedRepo = sel.value;
-        void this.plugin.saveMetadata();
-        this.render();
-      };
+    const activity = right.createDiv({ cls: 'linear-prs-merge-activity' });
+    activity.setAttr('role', 'img');
+    const days = metadata.mergeActivity;
+    const total = days?.reduce((sum, day) => sum + day.count, 0) ?? 0;
+    activity.setAttr(
+      'aria-label',
+      days
+        ? `${total} PRs merged over the last 14 days`
+        : 'Merge activity loads on refresh',
+    );
+    activity.createSpan({
+      cls: 'linear-prs-merge-caption',
+      text: days ? `${total} merged · 14d` : 'Merges · 14d',
+    });
+    const bars = activity.createDiv({ cls: 'linear-prs-merge-bars' });
+    const max = Math.max(1, ...(days?.map((day) => day.count) ?? []));
+    for (const day of days ??
+      Array.from({ length: 14 }, () => ({ date: '', count: 0 }))) {
+      const bar = bars.createSpan({ cls: 'linear-prs-merge-bar' });
+      bar.style.height = `${Math.max(2, (day.count / max) * 24)}px`;
+      bar.setAttr(
+        'title',
+        days
+          ? `${day.date}: ${day.count} merged`
+          : 'Click refresh to load merge activity',
+      );
+      if (!day.count) {
+        bar.addClass('is-empty');
+      }
     }
+
     const shortcutLabel = Platform.isMacOS ? '⌘F' : 'Ctrl+F';
     const search = right.createEl('input', {
       cls: 'linear-prs-search',

@@ -463,3 +463,33 @@
   color: var(--text-accent);
   text-decoration: none;
 }
+
+.linear-prs-merge-activity {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 116px;
+  flex-shrink: 0;
+}
+.linear-prs-merge-caption {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 12px;
+}
+.linear-prs-merge-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 24px;
+}
+.linear-prs-merge-bar {
+  flex: 1;
+  min-width: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--text-accent);
+  opacity: 0.8;
+}
+.linear-prs-merge-bar.is-empty {
+  background: var(--text-faint);
+  opacity: 0.25;
+}

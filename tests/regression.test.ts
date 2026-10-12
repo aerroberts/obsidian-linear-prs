@@ -1,3 +1,4 @@
+import { dailyMerges } from '../src/merge-activity';
 import { linearIssueLinks, rememberSearch } from '../src/linear-issue-links';
 import {
   fetchSnapshots,
@@ -552,6 +553,7 @@ test('full refresh uses two service queries and attaches PR context without text
       assert.match(query, /author:@me/);
       return {
         data: {
+          merged: { ...connection(), issueCount: 0 },
           search: {
             ...connection([
               {
@@ -641,6 +643,7 @@ test('account search follows cursors and refuses the GitHub search truncation li
     if (after === null)
       return {
         data: {
+          merged: { ...connection(), issueCount: 0 },
           search: {
             nodes: [graphSnapshot()],
             issueCount: 2,
@@ -795,4 +798,59 @@ test('search history persists completed terms with a bounded, case-insensitive r
     'ENG-4781',
   ]);
   assert.deepEqual(migrateMetadata({}).searchHistory, []);
+});
+
+test('merge activity fills fourteen local days and ignores dates outside the window', () => {
+  const now = new Date(2026, 9, 2, 12);
+  const days = dailyMerges(
+    [
+      new Date(2026, 9, 2, 8).toISOString(),
+      new Date(2026, 9, 2, 9).toISOString(),
+      new Date(2026, 8, 19, 0).toISOString(),
+      new Date(2026, 8, 18, 23).toISOString(),
+      new Date(2026, 9, 3, 0).toISOString(),
+      'invalid',
+    ],
+    now,
+  );
+  assert.equal(days.length, 14);
+  assert.deepEqual(days[0], { date: '2026-09-19', count: 1 });
+  assert.deepEqual(days[13], { date: '2026-10-02', count: 2 });
+  assert.equal(
+    days.reduce((sum, day) => sum + day.count, 0),
+    3,
+  );
+  assert.equal(migrateMetadata({}).mergeActivity, null);
+});
+
+test('merge activity shares the account query and follows its own cursor', async () => {
+  let calls = 0;
+  mockRequests(({ body }) => {
+    const payload = JSON.parse(body!);
+    calls++;
+    if (calls === 1) {
+      assert.match(payload.query, /AuthoredPullRequestSnapshots/);
+      assert.match(payload.query, /merged:search/);
+      return {
+        data: {
+          search: { ...connection(), issueCount: 0 },
+          merged: {
+            nodes: [{ mergedAt: '2026-10-01T12:00:00Z' }],
+            issueCount: 2,
+            pageInfo: { hasNextPage: true, endCursor: 'merges-next' },
+          },
+        },
+      };
+    }
+    assert.equal(payload.variables.after, 'merges-next');
+    return { data: { merged: connection([{ mergedAt: '2026-10-02T12:00:00Z' }]) } };
+  });
+  let dates: string[] = [];
+  await fetchAuthoredSnapshots('github', {
+    onMergedDates: (values) => {
+      dates = values;
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(dates.length, 2);
 });

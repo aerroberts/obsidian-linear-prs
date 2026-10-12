@@ -22,3 +22,5 @@ The API modules have separate responsibilities:
 Tests bundle with esbuild and mock only Obsidian's HTTP boundary. They run without an Obsidian install or live credentials. Production bundles leave Obsidian external. `styles.css` is generated from `src/styles.source.css`.
 
 Row refresh reads one snapshot, updates the branch if possible, and reads again only after an attempted update. Rebase verification waits for a changed head before repeating the base comparison. Bulk launch uses three concurrent workers and reuses the verified remote PR response.
+
+`src/merge-activity.ts` builds a zero-filled 14-day local-calendar series. Full account discovery reads merge timestamps in the same GraphQL operation and persists the series; scoped actions leave it unchanged. The repository selector is removed, so legacy `selectedRepo` metadata no longer filters the board.

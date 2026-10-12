@@ -24,6 +24,35 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 
+// src/merge-activity.ts
+function mergeWindow(now = /* @__PURE__ */ new Date()) {
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - 13);
+  return start;
+}
+function dailyMerges(mergedDates, now = /* @__PURE__ */ new Date()) {
+  const start = mergeWindow(now);
+  const days = [];
+  const dayKey = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  for (let i = 0; i < 14; i++) {
+    const day = new Date(start);
+    day.setDate(day.getDate() + i);
+    days.push({ date: dayKey(day), count: 0 });
+  }
+  for (const value of mergedDates) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime()) || date > now) {
+      continue;
+    }
+    const day = days.find((day2) => day2.date === dayKey(date));
+    if (day) {
+      day.count++;
+    }
+  }
+  return days;
+}
+
 // src/api/transport.ts
 var import_obsidian = require("obsidian");
 async function requestJson(url, method, token, body) {
@@ -182,15 +211,37 @@ async function fetchSnapshots(token, previous) {
   }
   return snapshots;
 }
-async function fetchAuthoredSnapshots(token) {
+async function fetchAuthoredSnapshots(token, options = {}) {
   const snapshots = [];
   let after = null;
   do {
+    const includeMerges = !!options.onMergedDates && after === null;
+    const mergeQuery = `is:pr is:merged author:@me merged:>=${mergeWindow().toISOString().slice(0, 10)}`;
     const result = await graphql(
       token,
-      `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}}}`,
+      `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}} ${includeMerges ? `merged:search(query:${JSON.stringify(mergeQuery)},type:ISSUE,first:100){issueCount nodes{... on PullRequest{mergedAt}} ${PAGE}}` : ""}}`,
       { after }
     );
+    if (includeMerges) {
+      if (!result.merged || result.merged.issueCount > 1e3) {
+        throw new Error("GitHub did not return complete merge activity.");
+      }
+      const dates = result.merged.nodes.map((pr) => pr.mergedAt);
+      let page2 = result.merged.pageInfo;
+      while (page2.hasNextPage) {
+        if (!page2.endCursor) {
+          throw new Error("Missing merge activity cursor.");
+        }
+        const next = await graphql(
+          token,
+          `query($after:String!){merged:search(query:${JSON.stringify(mergeQuery)},type:ISSUE,first:100,after:$after){nodes{... on PullRequest{mergedAt}} ${PAGE}}}`,
+          { after: page2.endCursor }
+        );
+        dates.push(...next.merged.nodes.map((pr) => pr.mergedAt));
+        page2 = next.merged.pageInfo;
+      }
+      options.onMergedDates?.(dates);
+    }
     if (result.search.issueCount > 1e3) {
       throw new Error(
         "GitHub search exceeds its 1,000-result limit; cached board was retained."
@@ -542,9 +593,14 @@ async function resolveLinearContexts(key, snapshots) {
 
 // src/api/discovery.ts
 async function discover(credentials) {
-  const snapshots = await fetchAuthoredSnapshots(credentials.githubKey);
+  let mergedDates = [];
+  const snapshots = await fetchAuthoredSnapshots(credentials.githubKey, {
+    onMergedDates: (dates) => {
+      mergedDates = dates;
+    }
+  });
   const prs = await resolveLinearContexts(credentials.linearKey, snapshots);
-  return { prs, errors: [] };
+  return { prs, errors: [], mergedDates };
 }
 async function refreshPrs(credentials, previous) {
   const snapshots = await fetchSnapshots(credentials.githubKey, previous);
@@ -565,6 +621,7 @@ var createEmptyMetadata = () => ({
   reviewTypes: {},
   reviewMessage: [],
   searchHistory: [],
+  mergeActivity: null,
   collapsed: [],
   selectedRepo: "",
   hidden: [],
@@ -988,8 +1045,6 @@ var BoardView = class extends import_obsidian5.ItemView {
     return metadata.pullRequests.filter(
       (pullRequest) => this.archived ? metadata.hidden.includes(pullRequest.id) : !metadata.hidden.includes(pullRequest.id)
     ).filter(
-      (pullRequest) => !metadata.selectedRepo || pullRequest.repo === metadata.selectedRepo
-    ).filter(
       (pullRequest) => !query || [
         pullRequest.title,
         pullRequest.repo,
@@ -1405,23 +1460,30 @@ var BoardView = class extends import_obsidian5.ItemView {
     const metadata = this.plugin.metadata;
     const header = shell.createDiv({ cls: "linear-prs-header" });
     const right = header.createSpan({ cls: "linear-prs-toolbar" });
-    const repos = [
-      ...new Set(metadata.pullRequests.map((pullRequest) => pullRequest.repo))
-    ].sort();
-    if (repos.length) {
-      const filter = right.createSpan({ cls: "linear-prs-repository-filter" });
-      createIcon(filter, "folder-git-2");
-      const sel = filter.createEl("select", {
-        attr: { "aria-label": "Filter repository" }
-      });
-      sel.createEl("option", { text: "All repositories", value: "" });
-      repos.forEach((r) => sel.createEl("option", { text: r, value: r }));
-      sel.value = metadata.selectedRepo;
-      sel.onchange = () => {
-        metadata.selectedRepo = sel.value;
-        void this.plugin.saveMetadata();
-        this.render();
-      };
+    const activity = right.createDiv({ cls: "linear-prs-merge-activity" });
+    activity.setAttr("role", "img");
+    const days = metadata.mergeActivity;
+    const total = days?.reduce((sum, day) => sum + day.count, 0) ?? 0;
+    activity.setAttr(
+      "aria-label",
+      days ? `${total} PRs merged over the last 14 days` : "Merge activity loads on refresh"
+    );
+    activity.createSpan({
+      cls: "linear-prs-merge-caption",
+      text: days ? `${total} merged \xB7 14d` : "Merges \xB7 14d"
+    });
+    const bars = activity.createDiv({ cls: "linear-prs-merge-bars" });
+    const max = Math.max(1, ...days?.map((day) => day.count) ?? []);
+    for (const day of days ?? Array.from({ length: 14 }, () => ({ date: "", count: 0 }))) {
+      const bar = bars.createSpan({ cls: "linear-prs-merge-bar" });
+      bar.style.height = `${Math.max(2, day.count / max * 24)}px`;
+      bar.setAttr(
+        "title",
+        days ? `${day.date}: ${day.count} merged` : "Click refresh to load merge activity"
+      );
+      if (!day.count) {
+        bar.addClass("is-empty");
+      }
     }
     const shortcutLabel = import_obsidian5.Platform.isMacOS ? "\u2318F" : "Ctrl+F";
     const search = right.createEl("input", {
@@ -1603,6 +1665,7 @@ var LinearPrsPlugin = class extends import_obsidian6.Plugin {
         )
       )
     ];
+    this.metadata.mergeActivity = dailyMerges(result.mergedDates);
     this.metadata.lastRefresh = (/* @__PURE__ */ new Date()).toISOString();
     await this.saveMetadata();
     return result;

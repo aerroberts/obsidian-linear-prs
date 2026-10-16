@@ -1,4 +1,9 @@
-import { dailyMerges } from '../src/merge-activity';
+import { RequestQueue } from '../src/api/request-queue';
+import { STAGES, stageTitle } from '../src/metadata';
+import { buildFileTree } from '../src/file-tree';
+import { fetchDescriptionImage } from '../src/api/description-images';
+import { fetchPullRequestDiff } from '../src/api/diff';
+import { activitySummary, dailyMerges } from '../src/merge-activity';
 import { linearIssueLinks, rememberSearch } from '../src/linear-issue-links';
 import {
   fetchSnapshots,
@@ -551,6 +556,7 @@ test('full refresh uses two service queries and attaches PR context without text
     const query = JSON.parse(body!).query;
     if (url.includes('github.com')) {
       assert.match(query, /author:@me/);
+      assert.match(query, /type:ISSUE,first:25,after:/);
       return {
         data: {
           merged: { ...connection(), issueCount: 0 },
@@ -853,4 +859,444 @@ test('merge activity shares the account query and follows its own cursor', async
   });
   assert.equal(calls, 2);
   assert.equal(dates.length, 2);
+});
+
+test('diff reads description and raw unified changes with GitHub authentication', async () => {
+  const diff = 'diff --git a/file b/file\n@@ -1 +1 @@\n-old\n+new\n';
+  const requests: string[] = [];
+  Object.assign(globalThis, {
+    requestMock: async (request: { url: string; headers: Record<string, string> }) => {
+      requests.push(request.url);
+      assert.equal(request.headers.Authorization, 'Bearer test-token');
+      return request.headers.Accept === 'application/vnd.github.diff'
+        ? { status: 200, text: diff }
+        : { status: 200, json: { ...remotePullRequest, body: '**Description**' } };
+    },
+  });
+  const reference = createPullRequestReference({ repo: 'owner/repo', number: 42 });
+  const result = await fetchPullRequestDiff('test-token', reference);
+  assert.deepEqual(result, { description: '**Description**', diff });
+  assert.deepEqual(
+    requests,
+    Array(2).fill('https://api.github.com/repos/owner/repo/pulls/42'),
+  );
+});
+
+test('diff reports GitHub failures and rejects missing credentials before requesting', async () => {
+  const reference = createPullRequestReference({ repo: 'owner/repo', number: 42 });
+  Object.assign(globalThis, {
+    requestMock: async () => {
+      throw new Error('Unexpected request');
+    },
+  });
+  await assert.rejects(fetchPullRequestDiff('', reference), /GitHub API key/);
+  Object.assign(globalThis, {
+    requestMock: async (request: { headers: Record<string, string> }) =>
+      request.headers.Accept
+        ? { status: 503, text: 'Diff unavailable' }
+        : { status: 200, json: remotePullRequest },
+  });
+  await assert.rejects(
+    fetchPullRequestDiff('test-token', reference),
+    /GitHub diff: 503 Diff unavailable/,
+  );
+  Object.assign(globalThis, {
+    requestMock: async () => ({ status: 200, json: remotePullRequest, text: '' }),
+  });
+  assert.deepEqual(await fetchPullRequestDiff('test-token', reference), {
+    description: '',
+    diff: '',
+  });
+});
+
+test('private description images resolve slash-containing branches through the GitHub API', async () => {
+  const requests: string[] = [];
+  Object.assign(globalThis, {
+    requestMock: async (request: { url: string; headers: Record<string, string> }) => {
+      requests.push(request.url);
+      assert.equal(request.headers.Authorization, 'Bearer image-token');
+      assert.equal(new URL(request.url).hostname, 'api.github.com');
+      return request.url.endsWith('ref=eric%2Fscreenshots')
+        ? {
+            status: 200,
+            headers: { 'content-type': 'image/png' },
+            arrayBuffer: new Uint8Array([137, 80, 78, 71]).buffer,
+          }
+        : { status: 404 };
+    },
+  });
+  const image = await fetchDescriptionImage(
+    'image-token',
+    'https://github.com/owner/repo/blob/eric/screenshots/images/example.png?raw=true',
+  );
+  assert.equal(requests.length, 2);
+  assert.equal(image?.type, 'image/png');
+  assert.equal(image?.size, 4);
+});
+
+test('description image authentication is never sent to external or lookalike hosts', async () => {
+  Object.assign(globalThis, {
+    requestMock: async () => {
+      throw new Error('Unexpected request');
+    },
+  });
+  for (const url of [
+    'https://example.com/image.png',
+    'https://github.com.example.com/o/r/blob/main/image.png',
+    'http://github.com/o/r/blob/main/image.png',
+    'https://user:password@github.com/o/r/blob/main/image.png',
+  ]) {
+    assert.equal(await fetchDescriptionImage('secret', url), undefined);
+  }
+});
+
+test('private image failures are explicit and do not retry rate limits', async () => {
+  let requests = 0;
+  Object.assign(globalThis, {
+    requestMock: async () => {
+      requests++;
+      return { status: 403 };
+    },
+  });
+  await assert.rejects(
+    fetchDescriptionImage(
+      'token',
+      'https://raw.githubusercontent.com/o/r/main/image.png',
+    ),
+    /GitHub image: 403/,
+  );
+  assert.equal(requests, 1);
+  Object.assign(globalThis, { requestMock: async () => ({ status: 404 }) });
+  await assert.rejects(
+    fetchDescriptionImage('token', 'https://github.com/o/r/blob/main/image.png'),
+    /could not be found/,
+  );
+});
+
+test('changed file tree groups shared folders without merging equal basenames', () => {
+  const select = () => {};
+  const tree = buildFileTree([
+    { filename: 'src/z.ts', select },
+    { filename: 'src/ui/index.ts', select },
+    { filename: 'README.md', select },
+    { filename: 'src/api/index.ts', select },
+  ]);
+  assert.deepEqual(
+    tree.map((node) => node.name),
+    ['src', 'README.md'],
+  );
+  assert.deepEqual(
+    tree[0].children.map((node) => node.name),
+    ['api', 'ui', 'z.ts'],
+  );
+  assert.equal(tree[0].children[0].children[0].file?.filename, 'src/api/index.ts');
+  assert.equal(tree[0].children[1].children[0].file?.filename, 'src/ui/index.ts');
+});
+
+test('section names and E/F assignments survive metadata migration', () => {
+  const original = {
+    reviewTypes: { five: 'E' as const, six: 'F' as const },
+    stageNames: { A: 'Needs review', F: 'Ready' },
+  };
+  const metadata = migrateMetadata(original);
+  assert.deepEqual(STAGES, ['A', 'B', 'C', 'D', 'E', 'F']);
+  assert.deepEqual(metadata.reviewTypes, original.reviewTypes);
+  assert.deepEqual(metadata.stageNames, original.stageNames);
+  assert.equal(stageTitle(metadata, 'A'), 'Staging A · Needs review');
+  assert.equal(stageTitle(metadata, 'B'), 'Staging B');
+  assert.deepEqual(migrateMetadata(JSON.parse(JSON.stringify(metadata))), metadata);
+});
+
+function queueFixture() {
+  let now = 1_800_000_000_000;
+  const waits: number[] = [];
+  const queue = new RequestQueue('Test API', {
+    now: () => now,
+    sleep: async (milliseconds) => {
+      waits.push(milliseconds);
+      now += milliseconds;
+    },
+  });
+  const ok = { status: 200, headers: {}, json: { data: {} }, text: '' };
+  return { queue, waits, ok, now: () => now };
+}
+
+test('nested API reads share a serial paced queue', async () => {
+  const { queue, waits, ok } = queueFixture();
+  let active = 0;
+  let peak = 0;
+  await Promise.all(
+    Array.from({ length: 30 }, () =>
+      queue.run(
+        async () => {
+          peak = Math.max(peak, ++active);
+          await Promise.resolve();
+          active--;
+          return ok;
+        },
+        { retry: true },
+      ),
+    ),
+  );
+  assert.equal(peak, 1);
+  assert.deepEqual(waits, Array(29).fill(250));
+});
+
+test('GitHub secondary throttling honors Retry-After before retrying', async () => {
+  const { queue, waits, ok } = queueFixture();
+  let calls = 0;
+  const result = await queue.run(
+    async () =>
+      ++calls === 1
+        ? {
+            ...ok,
+            status: 403,
+            headers: { 'Retry-After': '2' },
+            json: { message: 'secondary rate limit' },
+          }
+        : ok,
+    { retry: true },
+  );
+  assert.equal(result, ok);
+  assert.equal(calls, 2);
+  assert.deepEqual(waits, [2000]);
+});
+
+test('GitHub GraphQL 200 and Linear 400 throttles retry with bounded backoff', async () => {
+  for (const status of [200, 400]) {
+    const { queue, waits, ok } = queueFixture();
+    let calls = 0;
+    const error =
+      status === 200 ? { type: 'RATE_LIMITED' } : { extensions: { code: 'RATELIMITED' } };
+    await assert.rejects(
+      queue.run(
+        async () => {
+          calls++;
+          return {
+            ...ok,
+            status,
+            json: { errors: [{ message: 'Quota exceeded', ...error }] },
+          };
+        },
+        { retry: true },
+      ),
+      /rate limit.*cached board/,
+    );
+    assert.equal(calls, 3);
+    assert.deepEqual(waits, [60_000, 120_000]);
+    await assert.rejects(
+      queue.run(
+        async () => {
+          calls++;
+          return ok;
+        },
+        { retry: true },
+      ),
+      /rate limit/,
+    );
+    assert.equal(calls, 3);
+  }
+});
+
+test('long quota resets stop requests and retain cooldown across refresh attempts', async () => {
+  for (const service of ['github', 'linear']) {
+    const { queue, waits, ok, now } = queueFixture();
+    let calls = 0;
+    const headers: Record<string, string> =
+      service === 'github'
+        ? {
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String((now() + 3_600_000) / 1000),
+          }
+        : {
+            'x-ratelimit-complexity-remaining': '0',
+            'x-ratelimit-complexity-reset': String(now() + 3_600_000),
+          };
+    const request = async () => {
+      calls++;
+      return { ...ok, status: 429, headers };
+    };
+    await assert.rejects(queue.run(request, { retry: true }), /requests paused until/);
+    await assert.rejects(queue.run(request, { retry: true }), /requests paused until/);
+    assert.equal(calls, 1);
+    assert.deepEqual(waits, []);
+  }
+});
+
+test('permission errors and mutations are never automatically replayed', async () => {
+  for (const status of [400, 401, 403, 404, 422]) {
+    const { queue, ok } = queueFixture();
+    let calls = 0;
+    const result = await queue.run(
+      async () => {
+        calls++;
+        return { ...ok, status };
+      },
+      { retry: true },
+    );
+    assert.equal(result.status, status);
+    assert.equal(calls, 1);
+  }
+  const { queue, ok } = queueFixture();
+  let calls = 0;
+  await assert.rejects(
+    queue.run(
+      async () => {
+        calls++;
+        return { ...ok, status: 429 };
+      },
+      { retry: false },
+    ),
+    /rate limit/,
+  );
+  assert.equal(calls, 1);
+});
+
+test('large scoped refresh splits requests without losing PRs or associations', async () => {
+  const previous = Array.from({ length: 126 }, (_, index) => ({
+    ...createPullRequestReference({ repo: 'owner/repo', number: index + 1 }),
+    groupId: 'parent',
+    issueId: 'issue',
+  }));
+  const sizes: number[] = [];
+  mockRequests(({ body }) => {
+    const matches = [
+      ...JSON.parse(body!).query.matchAll(
+        /p(\d+):repository.*?pullRequest\(number:(\d+)\)/g,
+      ),
+    ];
+    sizes.push(matches.length);
+    return {
+      data: Object.fromEntries(
+        matches.map((match) => [
+          `p${match[1]}`,
+          {
+            pullRequest: {
+              ...graphSnapshot(),
+              number: Number(match[2]),
+              url: `https://github.com/owner/repo/pull/${match[2]}`,
+            },
+          },
+        ]),
+      ),
+    };
+  });
+  const result = await refreshPrs({ githubKey: 'github', linearKey: 'linear' }, previous);
+  assert.deepEqual(sizes, [25, 25, 25, 25, 25, 1]);
+  assert.equal(new Set(result.map((pr) => pr.id)).size, 126);
+  assert.ok(result.every((pr) => pr.issueId === 'issue' && pr.groupId === 'parent'));
+});
+
+test('large Linear context resolution uses bounded queries and retains every PR', async () => {
+  const snapshots = Array.from({ length: 76 }, (_, index) => ({
+    remote: {
+      ...remotePullRequest,
+      html_url: `https://github.com/owner/repo/pull/${index + 1}`,
+    },
+    pullRequest: createPullRequestReference({ repo: 'owner/repo', number: index + 1 }),
+  }));
+  const sizes: number[] = [];
+  mockRequests(({ body }) => {
+    const matches = [...JSON.parse(body!).query.matchAll(/p(\d+):attachmentsForURL/g)];
+    sizes.push(matches.length);
+    return {
+      data: Object.fromEntries(
+        matches.map((match) => [`p${match[1]}`, connection([{ issue: linkedIssue }])]),
+      ),
+    };
+  });
+  const result = await resolveLinearContexts('linear', snapshots);
+  assert.deepEqual(sizes, [25, 25, 25, 1]);
+  assert.equal(result.length, 76);
+  assert.ok(result.every((pr) => pr.issueId === linkedIssue.id));
+});
+
+test('known human comments skip irrelevant comment and thread pagination', async () => {
+  const snapshot = graphSnapshot();
+  snapshot.comments.pageInfo = { hasNextPage: true, endCursor: 'more-comments' };
+  snapshot.reviewThreads.pageInfo = { hasNextPage: true, endCursor: 'more-threads' };
+  let calls = 0;
+  mockRequests(() => {
+    calls++;
+    return { data: { p0: { pullRequest: snapshot } } };
+  });
+  const [result] = await fetchSnapshots('github', [
+    createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+  ]);
+  assert.equal(result.pullRequest?.comments, true);
+  assert.equal(calls, 1);
+});
+
+test('comment pagination stops on the first human instead of fetching all history', async () => {
+  const snapshot = graphSnapshot();
+  snapshot.reviews = connection();
+  snapshot.comments.pageInfo = { hasNextPage: true, endCursor: 'more-comments' };
+  snapshot.reviewThreads.pageInfo = { hasNextPage: true, endCursor: 'more-threads' };
+  let calls = 0;
+  mockRequests(({ body }) => {
+    calls++;
+    if (calls === 1) {
+      return { data: { p0: { pullRequest: snapshot } } };
+    }
+    assert.equal(JSON.parse(body!).variables.after, 'more-comments');
+    return {
+      data: {
+        node: {
+          comments: {
+            nodes: [{ author: { login: 'human', __typename: 'User' } }],
+            pageInfo: { hasNextPage: true, endCursor: 'unneeded' },
+          },
+        },
+      },
+    };
+  });
+  const [result] = await fetchSnapshots('github', [
+    createPullRequestReference({ repo: 'owner/repo', number: 42 }),
+  ]);
+  assert.equal(result.pullRequest?.comments, true);
+  assert.equal(calls, 2);
+});
+
+test('failed worker pools stop dispatch and settle in-flight work before rejecting', async () => {
+  const visited: number[] = [];
+  let finished = false;
+  await assert.rejects(
+    forEachConcurrent([1, 2, 3, 4], 2, async (item) => {
+      visited.push(item);
+      if (item === 1) {
+        await Promise.resolve();
+        throw new Error('Read failed');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      finished = true;
+    }),
+    /Read failed/,
+  );
+  assert.deepEqual(visited, [1, 2]);
+  assert.equal(finished, true);
+});
+
+test('activity summary counts today and all open PRs, excluding retained closed and hidden entries', () => {
+  const metadata = createEmptyMetadata();
+  const now = new Date(2026, 9, 16, 12);
+  metadata.lastRefresh = now.toISOString();
+  metadata.mergeActivity = [
+    { date: '2026-10-15', count: 52 },
+    { date: '2026-10-16', count: 3 },
+  ];
+  const reference = createPullRequestReference({ repo: 'owner/repo', number: 1 });
+  metadata.pullRequests = [
+    reference,
+    { ...reference, id: 'draft', state: 'draft' },
+    { ...reference, id: 'hidden' },
+    { ...reference, id: 'closed', state: 'closed' },
+  ];
+  metadata.hidden = ['hidden'];
+  metadata.reviewTypes[reference.id] = 'F';
+  assert.equal(activitySummary(metadata, now), '3 merged today, 2 open PRs');
+  assert.equal(
+    activitySummary(metadata, new Date(2026, 9, 17)),
+    '— merged today, 2 open PRs',
+  );
+  assert.equal(activitySummary(createEmptyMetadata(), now), '— merged today, — open PRs');
 });

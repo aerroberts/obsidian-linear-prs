@@ -54,6 +54,7 @@ interface Snapshot {
   statusCheckRollup: { id: string; contexts: Connection<Check> } | null;
 }
 
+const SNAPSHOT_BATCH_SIZE = 25;
 const PAGE = 'pageInfo { hasNextPage endCursor }';
 const ACTOR = 'author { login __typename }';
 const CHECK_FIELDS = `__typename
@@ -88,15 +89,15 @@ async function graphql<T>(
   return result.data;
 }
 
-async function completeConnection<T>(
+async function* connectionPages<T>(
   token: string,
   id: string,
   type: string,
   field: string,
   fields: string,
   connection: Connection<T>,
-): Promise<T[]> {
-  const nodes = [...connection.nodes];
+): AsyncGenerator<T[]> {
+  yield connection.nodes;
   let page = connection.pageInfo;
   while (page.hasNextPage) {
     if (!page.endCursor) {
@@ -108,10 +109,30 @@ async function completeConnection<T>(
       { id, after: page.endCursor },
     );
     const next = result.node[field];
-    nodes.push(...next.nodes);
+    yield next.nodes;
     page = next.pageInfo;
   }
+}
+
+async function completeConnection<T>(
+  ...parameters: Parameters<typeof connectionPages<T>>
+): Promise<T[]> {
+  const nodes: T[] = [];
+  for await (const page of connectionPages(...parameters)) {
+    nodes.push(...page);
+  }
   return nodes;
+}
+
+async function hasHumanComment(
+  ...parameters: Parameters<typeof connectionPages<Comment>>
+): Promise<boolean> {
+  for await (const page of connectionPages(...parameters)) {
+    if (page.some((comment) => comment.author?.__typename === 'User')) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface PullRequestSnapshot {
@@ -125,8 +146,8 @@ export async function fetchSnapshots(
   previous: PullRequest[],
 ): Promise<PullRequestSnapshot[]> {
   const snapshots: PullRequestSnapshot[] = [];
-  for (let start = 0; start < previous.length; start += 100) {
-    const batch = previous.slice(start, start + 100);
+  for (let start = 0; start < previous.length; start += SNAPSHOT_BATCH_SIZE) {
+    const batch = previous.slice(start, start + SNAPSHOT_BATCH_SIZE);
     const fields = batch
       .map((pr, index) => {
         const [owner, name] = pr.repo.split('/');
@@ -164,7 +185,7 @@ export async function fetchAuthoredSnapshots(
       merged?: Connection<{ mergedAt: string }> & { issueCount: number };
     } = await graphql(
       token,
-      `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:100,after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}} ${includeMerges ? `merged:search(query:${JSON.stringify(mergeQuery)},type:ISSUE,first:100){issueCount nodes{... on PullRequest{mergedAt}} ${PAGE}}` : ''}}`,
+      `query AuthoredPullRequestSnapshots($after:String){search(query:"is:pr is:open author:@me",type:ISSUE,first:${SNAPSHOT_BATCH_SIZE},after:$after){issueCount nodes{... on PullRequest{${FIELDS}}} ${PAGE}} ${includeMerges ? `merged:search(query:${JSON.stringify(mergeQuery)},type:ISSUE,first:100){issueCount nodes{... on PullRequest{mergedAt}} ${PAGE}}` : ''}}`,
       { after },
     );
     if (includeMerges) {
@@ -257,7 +278,7 @@ async function normalizeSnapshot(
   if (snapshot.state !== 'OPEN') {
     return { remote, pullRequest: null };
   }
-  const [reviews, requests, comments, threads, contexts] = await Promise.all([
+  const [reviews, requests, contexts] = await Promise.all([
     completeConnection(
       token,
       snapshot.id,
@@ -273,22 +294,6 @@ async function normalizeSnapshot(
       'reviewRequests',
       'requestedReviewer { __typename ... on User { login } ... on Bot { login } }',
       snapshot.reviewRequests,
-    ),
-    completeConnection(
-      token,
-      snapshot.id,
-      'PullRequest',
-      'comments',
-      ACTOR,
-      snapshot.comments,
-    ),
-    completeConnection(
-      token,
-      snapshot.id,
-      'PullRequest',
-      'reviewThreads',
-      `id comments(first:5){nodes{${ACTOR}} ${PAGE}}`,
-      snapshot.reviewThreads,
     ),
     snapshot.statusCheckRollup
       ? completeConnection(
@@ -323,27 +328,53 @@ async function normalizeSnapshot(
       reviewers.set(request.requestedReviewer.login, 'requested');
     }
   }
+  // The badge is a boolean: once any human comment is found, older comment
+  // and thread pages cannot change it. Reviews still paginate for reviewer state.
   let humanComments =
-    comments.some((comment) => comment.author?.__typename === 'User') ||
     reviews.some(
       (review) => review.author?.__typename === 'User' && Boolean(review.body.trim()),
+    ) ||
+    snapshot.comments.nodes.some((comment) => comment.author?.__typename === 'User') ||
+    snapshot.reviewThreads.nodes.some((thread) =>
+      thread.comments.nodes.some((comment) => comment.author?.__typename === 'User'),
     );
-  await forEachConcurrent(threads, 4, async (thread) => {
-    if (humanComments) {
-      return;
-    }
-    const comments = await completeConnection(
+  if (!humanComments) {
+    humanComments = await hasHumanComment(
       token,
-      thread.id,
-      'PullRequestReviewThread',
+      snapshot.id,
+      'PullRequest',
       'comments',
       ACTOR,
-      thread.comments,
+      snapshot.comments,
     );
-    if (comments.some((comment) => comment.author?.__typename === 'User')) {
-      humanComments = true;
+  }
+  if (!humanComments) {
+    for await (const threads of connectionPages(
+      token,
+      snapshot.id,
+      'PullRequest',
+      'reviewThreads',
+      `id comments(first:5){nodes{${ACTOR}} ${PAGE}}`,
+      snapshot.reviewThreads,
+    )) {
+      for (const thread of threads) {
+        humanComments = await hasHumanComment(
+          token,
+          thread.id,
+          'PullRequestReviewThread',
+          'comments',
+          ACTOR,
+          thread.comments,
+        );
+        if (humanComments) {
+          break;
+        }
+      }
+      if (humanComments) {
+        break;
+      }
     }
-  });
+  }
   const checks: PullRequest['checks'] = [];
   for (const context of contexts) {
     const pending =

@@ -2,12 +2,13 @@ import type { MergeDay } from './merge-activity';
 import type { PullRequest } from './types';
 export const BOARD_VIEW_TYPE = 'linear-prs';
 export const METADATA_PATH = '.linear-prs/metadata.json';
-export type Stage = 'A' | 'B' | 'C' | 'D';
+export type Stage = 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
 export type StagingAssignment = 'none' | Stage;
-export const STAGES: Stage[] = ['A', 'B', 'C', 'D'];
+export const STAGES: Stage[] = ['A', 'B', 'C', 'D', 'E', 'F'];
 export type Metadata = {
   version: 1;
   reviewTypes: Record<string, StagingAssignment>;
+  stageNames: Partial<Record<Stage, string>>;
   reviewMessage: string[];
   searchHistory: string[];
   mergeActivity: MergeDay[] | null;
@@ -30,6 +31,7 @@ export const DEFAULT_SETTINGS: Settings = {
 export const createEmptyMetadata = (): Metadata => ({
   version: 1,
   reviewTypes: {},
+  stageNames: {},
   reviewMessage: [],
   searchHistory: [],
   mergeActivity: null,
@@ -64,4 +66,9 @@ export function migrateMetadata(
     return id;
   });
   return metadata;
+}
+
+export function stageTitle(metadata: Metadata, stage: Stage): string {
+  const name = metadata.stageNames[stage];
+  return `Staging ${stage}${name ? ` · ${name}` : ''}`;
 }

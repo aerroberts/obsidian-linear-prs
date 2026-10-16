@@ -22,4 +22,7 @@ if (process.argv.includes('--watch')) {
 }
 
 const css = await readFile('src/styles.source.css', 'utf8');
-await writeFile('styles.css', css);
+const diffCss = (
+  await readFile('node_modules/diff2html/bundles/css/diff2html.min.css', 'utf8')
+).replace(':host,:root', '.linear-prs-diff');
+await writeFile('styles.css', diffCss + '\n' + css);

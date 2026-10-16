@@ -18,8 +18,8 @@ export async function resolveLinearContexts(
 ): Promise<PullRequest[]> {
   const open = snapshots.filter((snapshot) => snapshot.pullRequest !== null);
   const results: PullRequest[] = [];
-  for (let start = 0; start < open.length; start += 100) {
-    const batch = open.slice(start, start + 100);
+  for (let start = 0; start < open.length; start += 25) {
+    const batch = open.slice(start, start + 25);
     const identifiers = [
       ...new Set(batch.flatMap((snapshot) => referencedIdentifiers(snapshot.remote))),
     ];

@@ -1,7 +1,7 @@
 /** Response fields consumed by the plugin; remote payloads may contain more fields. */
 export interface GraphqlResponse<T> {
   data?: T;
-  errors?: { message: string }[];
+  errors?: { message: string; type?: string; extensions?: { code?: string } }[];
 }
 
 export interface GitHubUser {

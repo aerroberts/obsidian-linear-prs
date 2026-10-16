@@ -1,3 +1,4 @@
+import { activitySummary } from '../merge-activity';
 import { linearIssueLinks, rememberSearch } from '../linear-issue-links';
 import { fetchSnapshots } from '../api/snapshots';
 import { forEachConcurrent } from '../async';
@@ -6,7 +7,13 @@ import type { WorkspaceLeaf } from 'obsidian';
 import { ItemView, Notice, Platform, Scope } from 'obsidian';
 import type LinearPrsPlugin from '../main';
 import type { PullRequest } from '../types';
-import { STAGES, BOARD_VIEW_TYPE, type Stage, type StagingAssignment } from '../metadata';
+import {
+  STAGES,
+  stageTitle,
+  BOARD_VIEW_TYPE,
+  type Stage,
+  type StagingAssignment,
+} from '../metadata';
 import { closePr, launchPr, requestReviewer } from '../api/github';
 import {
   createIconButton,
@@ -181,7 +188,43 @@ export class BoardView extends ItemView {
       cls: 'linear-prs-group-header',
     });
     createIcon(summary, 'chevron-down', undefined, 'linear-prs-chevron');
-    summary.createSpan({ text: title, cls: 'linear-prs-group-title' });
+    const heading = summary.createSpan({
+      cls: 'linear-prs-group-title linear-prs-stage-heading',
+    });
+    heading.createSpan({ text: `Staging ${type}` });
+    const name = heading.createEl('input', {
+      cls: 'linear-prs-stage-name',
+      attr: {
+        type: 'text',
+        placeholder: 'Name…',
+        'aria-label': `Name for Staging ${type}`,
+        maxlength: '80',
+      },
+    });
+    name.value = this.plugin.metadata.stageNames[type] ?? '';
+    name.onclick = (event) => event.stopPropagation();
+    name.onkeydown = (event) => {
+      event.stopPropagation();
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        name.blur();
+      }
+      if (event.key === 'Escape') {
+        name.value = this.plugin.metadata.stageNames[type] ?? '';
+        name.blur();
+      }
+    };
+    name.onchange = () => {
+      const value = name.value.trim();
+      name.value = value;
+      this.plugin.metadata.stageNames[type] = value;
+      void this.plugin
+        .saveMetadata()
+        .catch(
+          (error) =>
+            new Notice(`Could not save section name: ${errorMessage(error)}`, 8000),
+        );
+    };
     const tools = summary.createSpan({ cls: 'linear-prs-actions' });
     tools.createSpan({ text: String(pullRequests.length), cls: 'linear-prs-count' });
     const key = `queue:${type}`;
@@ -325,7 +368,7 @@ export class BoardView extends ItemView {
     for (const stage of STAGES) {
       createIconButton(
         actions,
-        `Move all to Staging ${stage}`,
+        `Move all to ${stageTitle(metadata, stage)}`,
         stage,
         () =>
           void this.runAction(async () => {
@@ -459,7 +502,7 @@ export class BoardView extends ItemView {
     for (const stage of STAGES) {
       createIconButton(
         staging,
-        `Staging ${stage}`,
+        stageTitle(metadata, stage),
         stage,
         () =>
           void this.runAction(
@@ -490,7 +533,17 @@ export class BoardView extends ItemView {
     const a = refs.createEl('a', { href: pullRequest.url, cls: 'linear-prs-meta-link' });
     a.setAttr('target', '_blank');
     a.createSpan({ text: pullRequest.repo, cls: 'linear-prs-pill' });
-    a.createSpan({ text: `#${pullRequest.number}`, cls: 'linear-prs-pill' });
+    const number = refs.createEl('a', {
+      href: pullRequest.url,
+      text: `#${pullRequest.number}`,
+      cls: 'linear-prs-pill',
+    });
+    number.setAttr('aria-label', `Open diff for pull request #${pullRequest.number}`);
+    number.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.plugin.openPullRequestDiff(pullRequest);
+    };
     meta.createSpan({
       text: formatOpenedDate(pullRequest.createdAt),
       cls: 'linear-prs-date',
@@ -575,7 +628,7 @@ export class BoardView extends ItemView {
     const list = fetchPullRequest.createDiv({ cls: 'linear-prs-list' });
     pullRequests.forEach((pullRequest) => this.renderPullRequest(pullRequest, list));
   }
-  private render() {
+  render() {
     const root = this.containerEl.children[1] as HTMLElement;
     root.empty();
     root.addClass('linear-prs');
@@ -594,7 +647,7 @@ export class BoardView extends ItemView {
       for (const stage of STAGES) {
         this.renderStagingSection(
           all.filter((pullRequest) => metadata.reviewTypes[pullRequest.id] === stage),
-          `Staging ${stage}`,
+          stageTitle(metadata, stage),
           stage,
           shell,
         );
@@ -647,6 +700,16 @@ export class BoardView extends ItemView {
         bar.addClass('is-empty');
       }
     }
+
+    right.createSpan({
+      cls: 'linear-prs-activity-summary',
+      text: activitySummary(metadata),
+      attr: {
+        title: metadata.lastRefresh
+          ? `As of ${new Date(metadata.lastRefresh).toLocaleString()}. Refresh to update.`
+          : 'Refresh to load counts.',
+      },
+    });
 
     const shortcutLabel = Platform.isMacOS ? '⌘F' : 'Ctrl+F';
     const search = right.createEl('input', {

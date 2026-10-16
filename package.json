@@ -21,5 +21,9 @@
     "prettier": "3.9.9",
     "typescript": "^5.0.0",
     "typescript-eslint": "8.71.0"
+  },
+  "dependencies": {
+    "diff2html": "^3.4.56",
+    "highlight.js": "^11.12.0"
   }
 }

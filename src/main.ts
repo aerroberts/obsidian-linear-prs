@@ -17,12 +17,14 @@ import { withDeadline } from './async';
 import { errorMessage } from './ui/elements';
 import { Preferences } from './preferences';
 import { BoardView } from './ui/board-view';
+import { DiffView, DIFF_VIEW_TYPE } from './ui/diff-view';
 export default class LinearPrsPlugin extends Plugin {
   settings: Settings = DEFAULT_SETTINGS;
   metadata: Metadata = createEmptyMetadata();
   async onload() {
     this.settings = { ...DEFAULT_SETTINGS, ...(await this.loadData()) };
     await this.loadMetadata();
+    this.registerView(DIFF_VIEW_TYPE, (leaf) => new DiffView(leaf, this));
     this.registerView(BOARD_VIEW_TYPE, (leaf) => new BoardView(leaf, this));
     this.addRibbonIcon('git-pull-request', 'Linear PRs', () => void this.openBoard());
     this.addCommand({
@@ -42,6 +44,19 @@ export default class LinearPrsPlugin extends Plugin {
     await leaf.setViewState({ type: BOARD_VIEW_TYPE, active: true });
     this.app.workspace.revealLeaf(leaf);
   }
+  async openPullRequestDiff(pullRequest: PullRequest) {
+    try {
+      const leaf = this.app.workspace.openPopoutLeaf();
+      await leaf.setViewState({
+        type: DIFF_VIEW_TYPE,
+        active: true,
+        state: { pullRequestId: pullRequest.id },
+      });
+      await this.app.workspace.revealLeaf(leaf);
+    } catch (error) {
+      new Notice(`Could not open PR diff: ${errorMessage(error)}`, 8000);
+    }
+  }
   async loadMetadata() {
     const adapter = this.app.vault.adapter;
     if (await adapter.exists(METADATA_PATH)) {
@@ -53,29 +68,52 @@ export default class LinearPrsPlugin extends Plugin {
       }
     }
   }
-  async saveMetadata() {
+  async saveMetadata(options: { refreshBoards?: boolean } = {}) {
     const adapter = this.app.vault.adapter;
     if (!(await adapter.exists('.linear-prs'))) {
       await adapter.mkdir('.linear-prs');
     }
     await adapter.write(METADATA_PATH, JSON.stringify(this.metadata, null, 2) + '\n');
+    if (options.refreshBoards) {
+      for (const leaf of this.app.workspace.getLeavesOfType(BOARD_VIEW_TYPE)) {
+        if (leaf.view instanceof BoardView) {
+          leaf.view.render();
+        }
+      }
+    }
+    for (const leaf of this.app.workspace.getLeavesOfType(DIFF_VIEW_TYPE)) {
+      if (leaf.view instanceof DiffView) {
+        leaf.view.renderControls();
+      }
+    }
   }
   async saveSettings() {
     await this.saveData(this.settings);
   }
-  async refresh() {
+  private refreshTask: ReturnType<LinearPrsPlugin['refreshBoard']> | null = null;
+
+  refresh() {
+    // Keep this shared until the actual work finishes; a UI timeout must not start
+    // a second discovery while the first is still dispatching requests.
+    if (!this.refreshTask) {
+      this.refreshTask = this.refreshBoard().finally(() => {
+        this.refreshTask = null;
+      });
+    }
+    return this.refreshTask;
+  }
+
+  private async refreshBoard() {
     if (!this.settings.linearKey || !this.settings.githubKey) {
       throw new Error('Enter both API keys in Linear PRs settings.');
     }
-    const result = await withDeadline(discover(this.settings), 90000, 'Board refresh');
+    const result = await discover(this.settings);
+    const updated = new Set(result.prs.map((pullRequest) => pullRequest.id));
     this.metadata.pullRequests = [
       ...result.prs,
       ...this.metadata.pullRequests.filter(
         (pullRequest) =>
-          this.metadata.hidden.includes(pullRequest.id) &&
-          !result.prs.some(
-            (updatedPullRequest) => updatedPullRequest.id === pullRequest.id,
-          ),
+          this.metadata.hidden.includes(pullRequest.id) && !updated.has(pullRequest.id),
       ),
     ];
     this.metadata.mergeActivity = dailyMerges(result.mergedDates);
